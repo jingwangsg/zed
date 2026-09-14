@@ -589,6 +589,17 @@ fn codex_extra_headers(
     {
         header_pairs.push((HeaderName::from_static("chatgpt-account-id"), value));
     }
+    // Read the access token so existing sessions and refreshed tokens honor compute residency.
+    if let Some(residency) = extract_jwt_claims(&credentials.access_token).compute_residency
+        && !residency.is_empty()
+        && residency != "no_constraint"
+        && let Ok(value) = HeaderValue::from_str(&residency)
+    {
+        header_pairs.push((
+            HeaderName::from_static("x-openai-internal-codex-residency"),
+            value,
+        ));
+    }
     if let Some(routing_cache_key) = routing_cache_key
         && let Ok(value) = HeaderValue::from_str(routing_cache_key)
     {
@@ -1288,9 +1299,11 @@ async fn refresh_token(
     })
 }
 
+#[derive(Default)]
 struct JwtClaims {
     account_id: Option<String>,
     email: Option<String>,
+    compute_residency: Option<String>,
 }
 
 /// Extract claims from a JWT payload (base64url middle segment).
@@ -1298,22 +1311,13 @@ struct JwtClaims {
 /// implementation) and the `email` claim.
 fn extract_jwt_claims(jwt: &str) -> JwtClaims {
     let Some(payload_b64) = jwt.split('.').nth(1) else {
-        return JwtClaims {
-            account_id: None,
-            email: None,
-        };
+        return JwtClaims::default();
     };
     let Ok(payload) = URL_SAFE_NO_PAD.decode(payload_b64) else {
-        return JwtClaims {
-            account_id: None,
-            email: None,
-        };
+        return JwtClaims::default();
     };
     let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&payload) else {
-        return JwtClaims {
-            account_id: None,
-            email: None,
-        };
+        return JwtClaims::default();
     };
 
     let account_id = claims
@@ -1340,7 +1344,17 @@ fn extract_jwt_claims(jwt: &str) -> JwtClaims {
         .and_then(|v| v.as_str())
         .map(|s| s.to_owned());
 
-    JwtClaims { account_id, email }
+    let compute_residency = claims
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_compute_residency"))
+        .and_then(|residency| residency.as_str())
+        .map(str::to_owned);
+
+    JwtClaims {
+        account_id,
+        email,
+        compute_residency,
+    }
 }
 
 fn now_ms() -> u64 {
@@ -1362,6 +1376,91 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[gpui::test]
+    async fn test_requests_respect_compute_residency(cx: &mut TestAppContext) {
+        for (claims, expected_residency) in [
+            (
+                serde_json::json!({"chatgpt_compute_residency": "us"}),
+                Some("us"),
+            ),
+            (
+                serde_json::json!({
+                    "chatgpt_compute_residency": "eu",
+                    "chatgpt_data_residency": "us",
+                }),
+                Some("eu"),
+            ),
+            (
+                serde_json::json!({"chatgpt_compute_residency": "no_constraint"}),
+                None,
+            ),
+            (serde_json::json!({"chatgpt_compute_residency": ""}), None),
+            (
+                serde_json::json!({"chatgpt_compute_residency": "us\r\ninjected: value"}),
+                None,
+            ),
+            (serde_json::json!({"chatgpt_data_residency": "us"}), None),
+            (serde_json::json!({}), None),
+        ] {
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let http = FakeHttpClient::create({
+                let request_count = request_count.clone();
+                move |request| {
+                    let request_count = request_count.clone();
+                    async move {
+                        request_count.fetch_add(1, Ordering::SeqCst);
+                        if request
+                            .headers()
+                            .get("x-openai-internal-codex-residency")
+                            .and_then(|value| value.to_str().ok())
+                            != expected_residency
+                        {
+                            return Ok(http_client::Response::builder().status(401).body(
+                                AsyncBody::from(r#"{"error":{"message":"Workspace is not authorized in this region."}}"#),
+                            )?);
+                        }
+                        let body = match request.uri().path() {
+                            "/backend-api/codex/models" => serde_json::json!({
+                                "models": [{"slug": "gpt-5.5", "display_name": "GPT-5.5", "visibility": "list", "priority": 0}],
+                            })
+                            .to_string(),
+                            "/backend-api/codex/responses" => compaction_response_stream(),
+                            path => panic!("unexpected request path: {path}"),
+                        };
+                        Ok(http_client::Response::builder()
+                            .status(200)
+                            .body(AsyncBody::from(body))?)
+                    }
+                }
+            });
+            let mut credentials = make_fresh_credentials();
+            credentials.access_token = format!(
+                "header.{}.signature",
+                URL_SAFE_NO_PAD
+                    .encode(serde_json::json!({"https://api.openai.com/auth": claims}).to_string()),
+            );
+            let state = make_state(http, Some(credentials), cx);
+            let model = cx.read(|cx| create_language_model(ChatGptModel::Gpt55, &state, cx));
+            state
+                .update(cx, |state, cx| state.refresh_model_catalog(cx))
+                .await
+                .expect("request should honor the account compute residency");
+            let events = model
+                .stream_completion(LanguageModelRequest::default(), &cx.to_async())
+                .await
+                .expect("completion should honor the account compute residency")
+                .collect::<Vec<_>>()
+                .await;
+            assert!(!events.is_empty());
+            assert!(events.iter().all(Result::is_ok));
+            model
+                .compact(LanguageModelRequest::default(), &cx.to_async())
+                .await
+                .expect("request should honor the account compute residency");
+            assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        }
+    }
 
     #[gpui::test]
     async fn test_concurrent_refresh_deduplicates(cx: &mut TestAppContext) {
