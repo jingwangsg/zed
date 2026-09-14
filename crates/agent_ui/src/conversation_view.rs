@@ -997,15 +997,22 @@ impl ConversationView {
     }
 
     fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (resume_session_id, work_dirs, title) = self
+        let (resume_session_id, work_dirs, title, initial_content) = self
             .root_thread_view()
             .map(|thread_view| {
                 let tv = thread_view.read(cx);
                 let thread = tv.thread.read(cx);
+                // Native drafts have no stored session until their first message.
+                let is_native_draft = thread.is_draft_thread()
+                    && self.agent.clone().downcast::<NativeAgentServer>().is_some();
                 (
-                    Some(thread.session_id().clone()),
+                    (!is_native_draft).then(|| thread.session_id().clone()),
                     thread.work_dirs().cloned(),
                     thread.title(),
+                    is_native_draft.then(|| AgentInitialContent::ContentBlock {
+                        blocks: tv.message_editor.read(cx).draft_content_blocks_snapshot(cx),
+                        auto_submit: false,
+                    }),
                 )
             })
             .unwrap_or_else(|| {
@@ -1018,11 +1025,12 @@ impl ConversationView {
                         Some((Some(entry.folder_paths().clone()), entry.title()))
                     })
                     .unwrap_or((None, None));
-                (session_id, work_dirs, title)
+                (session_id, work_dirs, title, None)
             });
 
         self.clear_resolved_request_elicitations(cx);
         self.loading_status = None;
+        self.root_session_id = resume_session_id.clone();
 
         let state = Self::initial_state(
             self.agent.clone(),
@@ -1032,7 +1040,7 @@ impl ConversationView {
             work_dirs,
             title,
             self.project.clone(),
-            None,
+            initial_content,
             AgentThreadSource::AgentPanel,
             window,
             cx,
@@ -4734,6 +4742,53 @@ pub(crate) mod tests {
                 ),
             }
         });
+    }
+
+    #[gpui::test]
+    async fn test_reset_native_draft_after_connection_restart(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            language_model::LanguageModelRegistry::test(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let server = NativeAgentServer::new(fs, thread_store);
+        let (conversation_view, cx) = setup_conversation_view(server, cx).await;
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Unsent draft must survive reconnect", window, cx);
+        });
+        cx.run_until_parked();
+
+        for _ in 0..2 {
+            let previous_session_id = conversation_view.read_with(cx, |view, cx| {
+                view.active_thread()
+                    .expect("connected draft")
+                    .read(cx)
+                    .thread
+                    .read(cx)
+                    .session_id()
+                    .clone()
+            });
+            conversation_view.update_in(cx, |view, window, cx| {
+                view.retry_connection(window, cx);
+            });
+            cx.run_until_parked();
+
+            conversation_view.read_with(cx, |view, cx| {
+                if let ServerState::LoadError { error } = &view.server_state {
+                    panic!("Native draft reconnect failed: {error:?}");
+                }
+                let thread_view = view.active_thread().expect("reconnected draft").read(cx);
+                let thread = thread_view.thread.read(cx);
+                assert!(thread.is_draft_thread());
+                assert_ne!(thread.session_id(), &previous_session_id);
+            });
+            assert_eq!(
+                message_editor(&conversation_view, cx).read_with(cx, |editor, cx| editor.text(cx)),
+                "Unsent draft must survive reconnect",
+            );
+        }
     }
 
     #[gpui::test]
