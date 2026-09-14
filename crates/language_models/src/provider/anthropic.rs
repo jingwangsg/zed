@@ -1,3 +1,4 @@
+pub mod subscription;
 pub mod telemetry;
 
 use anthropic::{ANTHROPIC_API_URL, AnthropicError, AnthropicModelMode};
@@ -180,7 +181,7 @@ impl AnthropicLanguageModelProvider {
         Arc::new(AnthropicModel {
             id: LanguageModelId::from(model.id.to_string()),
             model,
-            state: self.state.clone(),
+            authentication: Authentication::ApiKey(self.state.clone()),
             http_client: self.http_client.clone(),
             request_limiter: RateLimiter::new(4),
         })
@@ -226,13 +227,13 @@ impl LanguageModelProvider for AnthropicLanguageModelProvider {
         // Pick the highest-version Sonnet we know about; otherwise the first
         // Claude model returned. Returning `None` until the fetch completes
         // matches the Ollama provider's behavior.
-        pick_preferred_model(&fetched, &["claude-sonnet-", "claude-opus-", "claude-"])
+        pick_preferred_model(&fetched, DEFAULT_MODEL_PREFIXES)
             .map(|model| self.create_language_model(model))
     }
 
     fn default_fast_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>> {
         let fetched = self.state.read(cx).fetched_models.clone();
-        pick_preferred_model(&fetched, &["claude-haiku-", "claude-"])
+        pick_preferred_model(&fetched, DEFAULT_FAST_MODEL_PREFIXES)
             .map(|model| self.create_language_model(model))
     }
 
@@ -244,25 +245,8 @@ impl LanguageModelProvider for AnthropicLanguageModelProvider {
     }
 
     fn provided_models(&self, cx: &App) -> Vec<Arc<dyn LanguageModel>> {
-        let mut models: BTreeMap<String, anthropic::Model> = BTreeMap::default();
-
-        // Models reported by Anthropic's `/v1/models` endpoint are the
-        // primary source. The list will be empty until authentication has
-        // succeeded and the first fetch completes.
-        for model in &self.state.read(cx).fetched_models {
-            models.insert(model.id.to_string(), model.clone());
-        }
-
-        // User-defined `available_models` from settings can either add
-        // entirely new entries or override fields on a fetched model with
-        // the same id (e.g. enable Fast mode or set a tool override).
-        for available in &AnthropicLanguageModelProvider::settings(cx).available_models {
-            let model = available_model_to_anthropic_model(available);
-            models.insert(model.id.to_string(), model);
-        }
-
-        models
-            .into_values()
+        models_with_overrides(&self.state.read(cx).fetched_models, cx)
+            .into_iter()
             .map(|model| self.create_language_model(model))
             .collect()
     }
@@ -301,6 +285,30 @@ impl LanguageModelProvider for AnthropicLanguageModelProvider {
         })
     }
 }
+
+fn models_with_overrides(fetched_models: &[anthropic::Model], cx: &App) -> Vec<anthropic::Model> {
+    let mut models: BTreeMap<String, anthropic::Model> = BTreeMap::default();
+
+    // Models reported by Anthropic's `/v1/models` endpoint are the
+    // primary source. The list will be empty until authentication has
+    // succeeded and the first fetch completes.
+    for model in fetched_models {
+        models.insert(model.id.to_string(), model.clone());
+    }
+
+    // User-defined `available_models` from settings can either add
+    // entirely new entries or override fields on a fetched model with
+    // the same id (e.g. enable Fast mode or set a tool override).
+    for available in &AnthropicLanguageModelProvider::settings(cx).available_models {
+        let model = available_model_to_anthropic_model(available);
+        models.insert(model.id.to_string(), model);
+    }
+
+    models.into_values().collect()
+}
+
+const DEFAULT_MODEL_PREFIXES: &[&str] = &["claude-sonnet-", "claude-opus-", "claude-"];
+const DEFAULT_FAST_MODEL_PREFIXES: &[&str] = &["claude-haiku-", "claude-"];
 
 /// Pick the model from `models` whose id starts with the earliest matching
 /// prefix in `preferred_prefixes`. Within a single prefix bucket the model
@@ -686,10 +694,15 @@ mod tests {
     }
 }
 
+enum Authentication {
+    ApiKey(Entity<State>),
+    Subscription(Entity<subscription::State>),
+}
+
 pub struct AnthropicModel {
     id: LanguageModelId,
     model: anthropic::Model,
-    state: Entity<State>,
+    authentication: Authentication,
     http_client: Arc<dyn HttpClient>,
     request_limiter: RateLimiter,
 }
@@ -697,7 +710,7 @@ pub struct AnthropicModel {
 impl AnthropicModel {
     fn stream_completion(
         &self,
-        request: anthropic::Request,
+        mut request: anthropic::Request,
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
@@ -707,23 +720,79 @@ impl AnthropicModel {
         >,
     > {
         let http_client = self.http_client.clone();
-
-        let (api_key, api_url, extra_headers) = self.state.read_with(cx, |state, cx| {
-            let api_url = AnthropicLanguageModelProvider::api_url(cx);
-            let extra_headers = AnthropicLanguageModelProvider::settings(cx)
-                .custom_headers
-                .clone();
-            (state.api_key_state.key(&api_url), api_url, extra_headers)
+        let provider = self.provider_name();
+        let (api_url, extra_headers) = cx.update(|cx| {
+            (
+                AnthropicLanguageModelProvider::api_url(cx),
+                AnthropicLanguageModelProvider::settings(cx)
+                    .custom_headers
+                    .clone(),
+            )
         });
 
         let beta_headers = self.model.beta_headers();
+        let credentials = match &self.authentication {
+            Authentication::ApiKey(state) => {
+                let api_key = state.read_with(cx, |state, _| state.api_key_state.key(&api_url));
+                async move {
+                    let api_key = api_key.ok_or(LanguageModelCompletionError::NoApiKey {
+                        provider: PROVIDER_NAME,
+                    })?;
+                    Ok::<_, LanguageModelCompletionError>((api_key, api_url, extra_headers))
+                }
+                .boxed()
+            }
+            Authentication::Subscription(state) => {
+                // load-bearing: Enterprise OAuth inference returns 429 without billing attribution.
+                let app_version = cx.update(|cx| release_channel::AppVersion::global(cx));
+                let mut system = match request.system.take() {
+                    Some(anthropic::StringOrContents::Content(system)) => system,
+                    Some(anthropic::StringOrContents::String(text)) => {
+                        vec![anthropic::RequestContent::Text {
+                            text,
+                            cache_control: None,
+                        }]
+                    }
+                    None => Vec::new(),
+                };
+                system.insert(
+                    0,
+                    anthropic::RequestContent::Text {
+                        text: format!(
+                            "x-anthropic-billing-header: cc_version=zed/{app_version}; cc_entrypoint=zed;"
+                        ),
+                        cache_control: None,
+                    },
+                );
+                request.system = Some(anthropic::StringOrContents::Content(system));
+                let credentials = cx.update(|cx| {
+                    state.update(cx, |state, cx| {
+                        state
+                            .credentials
+                            .is_some()
+                            .then(|| state.fresh_credentials(cx))
+                    })
+                });
+                let provider = provider.clone();
+                async move {
+                    let credentials = credentials
+                        .ok_or(LanguageModelCompletionError::NoApiKey { provider })?
+                        .await
+                        .map_err(|error| {
+                            LanguageModelCompletionError::Other(anyhow::anyhow!("{error:#}"))
+                        })?;
+                    Ok((
+                        Arc::<str>::from(""),
+                        api_url,
+                        CustomHeaders::new(credentials.headers(&extra_headers)?),
+                    ))
+                }
+                .boxed()
+            }
+        };
 
         async move {
-            let Some(api_key) = api_key else {
-                return Err(LanguageModelCompletionError::NoApiKey {
-                    provider: PROVIDER_NAME,
-                });
-            };
+            let (api_key, api_url, extra_headers) = credentials.await?;
             let request = anthropic::stream_completion(
                 http_client.as_ref(),
                 &api_url,
@@ -732,7 +801,9 @@ impl AnthropicModel {
                 beta_headers,
                 &extra_headers,
             );
-            request.await.map_err(Into::into)
+            request
+                .await
+                .map_err(|error| anthropic::completion_error_from_anthropic(error, provider))
         }
         .boxed()
     }
@@ -748,11 +819,17 @@ impl LanguageModel for AnthropicModel {
     }
 
     fn provider_id(&self) -> LanguageModelProviderId {
-        PROVIDER_ID
+        match self.authentication {
+            Authentication::ApiKey(_) => PROVIDER_ID,
+            Authentication::Subscription(_) => subscription::PROVIDER_ID,
+        }
     }
 
     fn provider_name(&self) -> LanguageModelProviderName {
-        PROVIDER_NAME
+        match self.authentication {
+            Authentication::ApiKey(_) => PROVIDER_NAME,
+            Authentication::Subscription(_) => subscription::PROVIDER_NAME,
+        }
     }
 
     fn supports_tools(&self) -> bool {
@@ -824,7 +901,7 @@ impl LanguageModel for AnthropicModel {
             self.model.max_output_tokens,
             self.model.mode.clone(),
             AnthropicPromptCacheMode::Automatic,
-            &PROVIDER_ID,
+            &self.provider_id(),
         ) {
             Ok(request) => request.into_compact_request(),
             Err(error) => return async move { Err(error.into()) }.boxed(),
@@ -834,11 +911,14 @@ impl LanguageModel for AnthropicModel {
         }
         let request = self.stream_completion(request, cx);
         let executor = cx.background_executor().clone();
+        let provider_id = self.provider_id();
+        let provider_name = self.provider_name();
         let future = self.request_limiter.run(async move {
             let response = request.await?;
-            let stream = AnthropicEventMapper::new(PROVIDER_NAME, PROVIDER_ID).map_stream(response);
+            let stream =
+                AnthropicEventMapper::new(provider_name.clone(), provider_id).map_stream(response);
             let stream = language_model::stream_in_background(stream.boxed(), executor);
-            let (context, usage) = collect_compaction_result(stream.boxed(), PROVIDER_NAME).await?;
+            let (context, usage) = collect_compaction_result(stream.boxed(), provider_name).await?;
             Ok(CompactionResult { context, usage })
         });
         future.boxed()
@@ -867,14 +947,17 @@ impl LanguageModel for AnthropicModel {
     }
 
     fn telemetry_id(&self) -> String {
-        format!("anthropic/{}", self.model.id)
+        format!("{}/{}", self.provider_id(), self.model.id)
     }
 
     fn api_key(&self, cx: &App) -> Option<String> {
-        self.state.read_with(cx, |state, cx| {
-            let api_url = AnthropicLanguageModelProvider::api_url(cx);
-            state.api_key_state.key(&api_url).map(|key| key.to_string())
-        })
+        match &self.authentication {
+            Authentication::ApiKey(state) => state.read_with(cx, |state, cx| {
+                let api_url = AnthropicLanguageModelProvider::api_url(cx);
+                state.api_key_state.key(&api_url).map(|key| key.to_string())
+            }),
+            Authentication::Subscription(_) => None,
+        }
     }
 
     fn max_token_count(&self) -> u64 {
@@ -905,7 +988,7 @@ impl LanguageModel for AnthropicModel {
             self.model.max_output_tokens,
             self.model.mode.clone(),
             AnthropicPromptCacheMode::Automatic,
-            &PROVIDER_ID,
+            &self.provider_id(),
         ) {
             Ok(request) => request,
             Err(error) => return async move { Err(error.into()) }.boxed(),
@@ -915,9 +998,11 @@ impl LanguageModel for AnthropicModel {
         }
         let request = self.stream_completion(request, cx);
         let executor = cx.background_executor().clone();
+        let provider_id = self.provider_id();
+        let provider_name = self.provider_name();
         let future = self.request_limiter.stream(async move {
             let response = request.await?;
-            let events = AnthropicEventMapper::new(PROVIDER_NAME, PROVIDER_ID).map_stream(response);
+            let events = AnthropicEventMapper::new(provider_name, provider_id).map_stream(response);
             Ok(language_model::stream_in_background(
                 events.boxed(),
                 executor,

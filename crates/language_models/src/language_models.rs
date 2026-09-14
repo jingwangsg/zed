@@ -15,6 +15,7 @@ mod settings;
 pub use crate::extension::init_proxy as init_extension_proxy;
 
 use crate::provider::anthropic::AnthropicLanguageModelProvider;
+use crate::provider::anthropic::subscription::ClaudeSubscriptionProvider;
 use crate::provider::anthropic_compatible::AnthropicCompatibleLanguageModelProvider;
 use crate::provider::bedrock::BedrockLanguageModelProvider;
 use crate::provider::cloud::CloudLanguageModelProvider;
@@ -230,6 +231,14 @@ fn register_language_model_providers(
     );
     registry.register_provider(
         Arc::new(AnthropicLanguageModelProvider::new(
+            client.http_client(),
+            credentials_provider.clone(),
+            cx,
+        )),
+        cx,
+    );
+    registry.register_provider(
+        Arc::new(ClaudeSubscriptionProvider::new(
             client.http_client(),
             credentials_provider.clone(),
             cx,

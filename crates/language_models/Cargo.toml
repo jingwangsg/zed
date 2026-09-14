@@ -52,6 +52,7 @@ log.workspace = true
 menu.workspace = true
 mistral = { workspace = true, features = ["schemars"] }
 ollama = { workspace = true, features = ["schemars"] }
+oauth_callback_server.workspace = true
 open_ai = { workspace = true, features = ["schemars"] }
 openai_subscribed.workspace = true
 opencode = { workspace = true, features = ["schemars"] }
@@ -67,6 +68,7 @@ strum.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 ui.workspace = true
 ui_input.workspace = true
+url.workspace = true
 util.workspace = true
 x_ai = { workspace = true, features = ["schemars"] }
 
