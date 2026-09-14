@@ -14,7 +14,7 @@ use language_model::{
     LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelId, LanguageModelName,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
     LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoice,
-    ProviderSettingsView, RateLimiter, env_var,
+    ProviderErrorCategory, ProviderSettingsView, RateLimiter, env_var,
 };
 use settings::{Settings, SettingsStore};
 use std::sync::{Arc, LazyLock};
@@ -275,14 +275,18 @@ impl LanguageModelProvider for AnthropicLanguageModelProvider {
     }
 
     fn fast_mode_confirmation(&self, _cx: &App) -> Option<FastModeConfirmation> {
-        Some(FastModeConfirmation {
-            title: "Enable Fast Mode for Anthropic?".into(),
-            message: "Fast mode lets requests use your Anthropic Priority Tier capacity, which \
-                Anthropic prioritizes over standard requests during peak load. Requires a \
-                Priority Tier commitment with Anthropic; without one, requests behave the same \
-                as the standard tier."
-                .into(),
-        })
+        Some(claude_fast_mode_confirmation())
+    }
+}
+
+fn claude_fast_mode_confirmation() -> FastModeConfirmation {
+    FastModeConfirmation {
+        title: "Enable Fast Mode for Anthropic?".into(),
+        message: "Fast mode lets requests use your Anthropic Priority Tier capacity, which \
+            Anthropic prioritizes over standard requests during peak load. Requires a \
+            Priority Tier commitment with Anthropic; without one, requests behave the same \
+            as the standard tier."
+            .into(),
     }
 }
 
@@ -721,19 +725,16 @@ impl AnthropicModel {
     > {
         let http_client = self.http_client.clone();
         let provider = self.provider_name();
-        let (api_url, extra_headers) = cx.update(|cx| {
-            (
-                AnthropicLanguageModelProvider::api_url(cx),
-                AnthropicLanguageModelProvider::settings(cx)
-                    .custom_headers
-                    .clone(),
-            )
-        });
-
         let beta_headers = self.model.beta_headers();
         let credentials = match &self.authentication {
             Authentication::ApiKey(state) => {
-                let api_key = state.read_with(cx, |state, _| state.api_key_state.key(&api_url));
+                let (api_key, api_url, extra_headers) = state.read_with(cx, |state, cx| {
+                    let api_url = AnthropicLanguageModelProvider::api_url(cx);
+                    let extra_headers = AnthropicLanguageModelProvider::settings(cx)
+                        .custom_headers
+                        .clone();
+                    (state.api_key_state.key(&api_url), api_url, extra_headers)
+                });
                 async move {
                     let api_key = api_key.ok_or(LanguageModelCompletionError::NoApiKey {
                         provider: PROVIDER_NAME,
@@ -743,8 +744,22 @@ impl AnthropicModel {
                 .boxed()
             }
             Authentication::Subscription(state) => {
+                let (api_url, extra_headers, app_version, credentials) = cx.update(|cx| {
+                    (
+                        AnthropicLanguageModelProvider::api_url(cx),
+                        AnthropicLanguageModelProvider::settings(cx)
+                            .custom_headers
+                            .clone(),
+                        release_channel::AppVersion::global(cx),
+                        state.update(cx, |state, cx| {
+                            state
+                                .credentials
+                                .is_some()
+                                .then(|| state.fresh_credentials(cx))
+                        }),
+                    )
+                });
                 // load-bearing: Enterprise OAuth inference returns 429 without billing attribution.
-                let app_version = cx.update(|cx| release_channel::AppVersion::global(cx));
                 let mut system = match request.system.take() {
                     Some(anthropic::StringOrContents::Content(system)) => system,
                     Some(anthropic::StringOrContents::String(text)) => {
@@ -765,21 +780,28 @@ impl AnthropicModel {
                     },
                 );
                 request.system = Some(anthropic::StringOrContents::Content(system));
-                let credentials = cx.update(|cx| {
-                    state.update(cx, |state, cx| {
-                        state
-                            .credentials
-                            .is_some()
-                            .then(|| state.fresh_credentials(cx))
-                    })
-                });
-                let provider = provider.clone();
                 async move {
                     let credentials = credentials
-                        .ok_or(LanguageModelCompletionError::NoApiKey { provider })?
+                        .ok_or(LanguageModelCompletionError::NoApiKey {
+                            provider: subscription::PROVIDER_NAME,
+                        })?
                         .await
                         .map_err(|error| {
-                            LanguageModelCompletionError::Other(anyhow::anyhow!("{error:#}"))
+                            match error.downcast_ref::<subscription::SessionExpired>() {
+                                Some(expired) => {
+                                    LanguageModelCompletionError::from_provider_response(
+                                        subscription::PROVIDER_NAME,
+                                        Some(expired.status),
+                                        None,
+                                        error.to_string(),
+                                        None,
+                                        ProviderErrorCategory::Authentication,
+                                    )
+                                }
+                                None => LanguageModelCompletionError::Other(anyhow::anyhow!(
+                                    "{error:#}"
+                                )),
+                            }
                         })?;
                     Ok((
                         Arc::<str>::from(""),
