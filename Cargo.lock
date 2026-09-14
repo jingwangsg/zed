@@ -9691,6 +9691,7 @@ dependencies = [
  "log",
  "menu",
  "mistral",
+ "oauth_callback_server",
  "ollama",
  "open_ai",
  "open_router",
@@ -9708,6 +9709,7 @@ dependencies = [
  "tokio",
  "ui",
  "ui_input",
+ "url",
  "util",
  "x_ai",
 ]

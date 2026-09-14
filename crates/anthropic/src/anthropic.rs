@@ -350,12 +350,16 @@ pub async fn list_models(
 ) -> Result<Vec<Model>, AnthropicError> {
     let uri = format!("{api_url}/v1/models?limit=1000");
 
-    let request = HttpRequest::builder()
+    let mut request = HttpRequest::builder()
         .method(Method::GET)
         .uri(uri)
         .header("Anthropic-Version", "2023-06-01")
-        .header("X-Api-Key", api_key.trim())
-        .header("Accept", "application/json")
+        .header("Accept", "application/json");
+    // Subscription callers authenticate with a Bearer token in extra_headers and pass an empty key.
+    if !api_key.trim().is_empty() {
+        request = request.header("X-Api-Key", api_key.trim());
+    }
+    let request = request
         .extra_headers(extra_headers)
         .body(AsyncBody::default())
         .map_err(AnthropicError::BuildRequestBody)?;
@@ -437,8 +441,12 @@ async fn send_request(
         .method(Method::POST)
         .uri(uri)
         .header("Anthropic-Version", "2023-06-01")
-        .header("X-Api-Key", api_key.trim())
         .header("Content-Type", "application/json");
+
+    // Subscription callers authenticate with a Bearer token in extra_headers and pass an empty key.
+    if !api_key.trim().is_empty() {
+        request_builder = request_builder.header("X-Api-Key", api_key.trim());
+    }
 
     if let Some(beta_headers) = beta_headers {
         request_builder = request_builder.header("Anthropic-Beta", beta_headers);

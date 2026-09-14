@@ -632,6 +632,7 @@ impl JsonSchema for LanguageModelProviderSetting {
                     "enum": [
                         "amazon-bedrock",
                         "anthropic",
+                        "claude-subscription",
                         "copilot_chat",
                         "deepseek",
                         "google",
