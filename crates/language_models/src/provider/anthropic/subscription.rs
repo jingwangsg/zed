@@ -1,6 +1,7 @@
 use super::{
     AnthropicLanguageModelProvider, AnthropicModel, Authentication, DEFAULT_FAST_MODEL_PREFIXES,
-    DEFAULT_MODEL_PREFIXES, models_with_overrides, pick_preferred_model,
+    DEFAULT_MODEL_PREFIXES, claude_fast_mode_confirmation, models_with_overrides,
+    pick_preferred_model,
 };
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -9,12 +10,12 @@ use futures::{AsyncReadExt as _, FutureExt as _, future::Shared, lock::Mutex};
 use gpui::{App, AppContext as _, Context, Entity, SharedString, Task, Window};
 use http_client::{
     AsyncBody, CustomHeaders, HttpClient, HttpRequestExt as _, Request,
-    http::{HeaderName, HeaderValue},
+    http::{HeaderName, HeaderValue, StatusCode},
 };
 use language_model::{
-    AuthenticateError, IconOrSvg, InlineDescription, InlineProviderSettings, LanguageModel,
-    LanguageModelId, LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
-    LanguageModelProviderState, ProviderSettingsView, RateLimiter,
+    AuthenticateError, FastModeConfirmation, IconOrSvg, InlineDescription, InlineProviderSettings,
+    LanguageModel, LanguageModelId, LanguageModelProvider, LanguageModelProviderId,
+    LanguageModelProviderName, LanguageModelProviderState, ProviderSettingsView, RateLimiter,
 };
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
@@ -45,7 +46,35 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+async fn post_token(
+    http_client: &dyn HttpClient,
+    body: serde_json::Value,
+) -> Result<(StatusCode, Vec<u8>)> {
+    let request = Request::post(TOKEN_URL)
+        .timeout(Duration::from_secs(30))
+        .header("Content-Type", "application/json")
+        .body(AsyncBody::from(serde_json::to_string(&body)?))?;
+    let mut response = http_client.send(request).await?;
+    let mut body = Vec::new();
+    response.body_mut().read_to_end(&mut body).await?;
+    Ok((response.status(), body))
+}
+
 type RefreshTask = Shared<Task<Result<Credentials, Arc<anyhow::Error>>>>;
+
+/// The refresh token was rejected and the stored credentials have been cleared.
+#[derive(Debug)]
+pub(super) struct SessionExpired {
+    pub(super) status: StatusCode,
+}
+
+impl std::fmt::Display for SessionExpired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Claude session expired (HTTP {})", self.status)
+    }
+}
+
+impl std::error::Error for SessionExpired {}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Credentials {
@@ -181,21 +210,28 @@ impl State {
         let task = cx
             .spawn(async move |this, cx| {
                 let result = async {
+                    let (status, body) = post_token(
+                        http_client.as_ref(),
+                        serde_json::json!({
+                            "grant_type": "refresh_token", "client_id": CLIENT_ID,
+                            "refresh_token": credentials.refresh_token,
+                        }),
+                    )
+                    .await?;
+                    // Taken only after the network round trip so a sign-in that lands
+                    // meanwhile does not wait on it.
                     let _guard = credential_lock.lock().await;
-                    let request = Request::post(TOKEN_URL)
-                        .timeout(Duration::from_secs(30))
-                        .header("Content-Type", "application/json")
-                        .body(AsyncBody::from(serde_json::to_string(
-                            &serde_json::json!({
-                                "grant_type": "refresh_token", "client_id": CLIENT_ID,
-                                "refresh_token": credentials.refresh_token,
-                            }),
-                        )?))?;
-                    let mut response = http_client.send(request).await?;
-                    if this.read_with(cx, |state, _| state.generation)? != generation {
+                    // A sign-in or sign-out that finished meanwhile owns the credentials now.
+                    let still_current = this.read_with(cx, |state, _| {
+                        state
+                            .credentials
+                            .as_ref()
+                            .map(|current| &current.refresh_token)
+                            == Some(&credentials.refresh_token)
+                    })?;
+                    if !still_current {
                         bail!("Claude sign-in changed during token refresh");
                     }
-                    let status = response.status();
                     if matches!(status.as_u16(), 400 | 401 | 403) {
                         this.update(cx, |state, cx| {
                             state.credentials = None;
@@ -204,17 +240,18 @@ impl State {
                                 Some("Your Claude session expired. Sign in again.".into());
                             cx.notify();
                         })?;
+                        // The session-expired error must win over a keychain cleanup failure.
                         credentials_provider
                             .delete_credentials(CREDENTIALS_KEY, cx)
-                            .await?;
+                            .await
+                            .log_err();
+                        return Err(SessionExpired { status }.into());
                     }
                     if !status.is_success() {
                         bail!("Claude token refresh failed (HTTP {status})");
                     }
-                    let mut body = Vec::new();
-                    response.body_mut().read_to_end(&mut body).await?;
                     let tokens: TokenResponse = serde_json::from_slice(&body)?;
-                    let credentials = Credentials {
+                    let refreshed = Credentials {
                         access_token: tokens.access_token,
                         refresh_token: tokens.refresh_token.unwrap_or(credentials.refresh_token),
                         expires_at: now_secs().saturating_add(tokens.expires_in),
@@ -223,26 +260,25 @@ impl State {
                             .and_then(|account| account.email_address)
                             .or(credentials.email),
                     };
-                    if this.read_with(cx, |state, _| state.generation)? != generation {
-                        bail!("Claude sign-in changed during token refresh");
-                    }
                     credentials_provider
                         .write_credentials(
                             CREDENTIALS_KEY,
                             "Bearer",
-                            &serde_json::to_vec(&credentials)?,
+                            &serde_json::to_vec(&refreshed)?,
                             cx,
                         )
                         .await?;
                     this.update(cx, |state, cx| {
-                        if state.generation != generation {
-                            bail!("Claude sign-in changed during token refresh");
+                        // While the lock is held only a sign-out can change the credentials,
+                        // and its keychain delete runs after this write.
+                        if state.credentials.is_none() {
+                            bail!("Claude signed out during token refresh");
                         }
-                        state.credentials = Some(credentials.clone());
+                        state.credentials = Some(refreshed.clone());
                         cx.notify();
                         Ok(())
                     })??;
-                    Ok(credentials)
+                    Ok(refreshed)
                 }
                 .await;
                 this.update(cx, |state, _| {
@@ -331,7 +367,10 @@ impl State {
                     .append_pair("code_challenge_method", "S256")
                     .append_pair("state", &expected_state);
                 cx.update(|cx| cx.open_url(url.as_str()));
-                let callback = callback.await.context("Claude sign-in was cancelled")??;
+                // The callback server drops its sender on timeout as well as on cancel.
+                let callback = callback
+                    .await
+                    .context("Claude sign-in was cancelled or timed out")??;
                 if callback.state != expected_state {
                     bail!("Claude OAuth state mismatch");
                 }
@@ -340,22 +379,18 @@ impl State {
                     state.persisting = true;
                     cx.notify();
                 })?;
-                let request = Request::post(TOKEN_URL)
-                    .timeout(Duration::from_secs(30))
-                    .header("Content-Type", "application/json")
-                    .body(AsyncBody::from(serde_json::to_string(
-                        &serde_json::json!({
-                            "grant_type": "authorization_code", "client_id": CLIENT_ID,
-                            "code": callback.code, "state": expected_state,
-                            "redirect_uri": redirect_uri, "code_verifier": verifier,
-                        }),
-                    )?))?;
-                let mut response = http_client.send(request).await?;
-                if !response.status().is_success() {
-                    bail!("Claude sign-in failed (HTTP {})", response.status());
+                let (status, body) = post_token(
+                    http_client.as_ref(),
+                    serde_json::json!({
+                        "grant_type": "authorization_code", "client_id": CLIENT_ID,
+                        "code": callback.code, "state": expected_state,
+                        "redirect_uri": redirect_uri, "code_verifier": verifier,
+                    }),
+                )
+                .await?;
+                if !status.is_success() {
+                    bail!("Claude sign-in failed (HTTP {status})");
                 }
-                let mut body = Vec::new();
-                response.body_mut().read_to_end(&mut body).await?;
                 let tokens: TokenResponse = serde_json::from_slice(&body)?;
                 let credentials = Credentials {
                     access_token: tokens.access_token,
@@ -555,6 +590,9 @@ impl LanguageModelProvider for ClaudeSubscriptionProvider {
             }),
         }))
     }
+    fn fast_mode_confirmation(&self, _cx: &App) -> Option<FastModeConfirmation> {
+        Some(claude_fast_mode_confirmation())
+    }
     fn authentication_error_message(&self) -> SharedString {
         "Your Claude session is invalid or expired. Sign in again in Settings > AI > LLM Providers > Claude Subscription.".into()
     }
@@ -594,7 +632,7 @@ impl Render for ConfigurationView {
             view = view.child(
                 Button::new(
                     "claude-sign-in",
-                    if busy {
+                    if state.sign_in_task.is_some() {
                         "Signing in…"
                     } else {
                         "Sign In with Claude"
@@ -1122,6 +1160,58 @@ mod tests {
             );
             assert_eq!(storage.stored.lock().is_some(), retryable, "HTTP {status}");
         }
+    }
+
+    #[gpui::test]
+    async fn rejected_refresh_surfaces_authentication_error(cx: &mut TestAppContext) {
+        init_test(cx);
+        let http_client = FakeHttpClient::create(|request| async move {
+            let (status, body) = match request.uri().path() {
+                "/v1/models" => (200, models_response()),
+                "/v1/oauth/token" => (401, "{}".to_string()),
+                path => panic!("unexpected request: {path}"),
+            };
+            Ok(Response::builder()
+                .status(status)
+                .body(AsyncBody::from(body))?)
+        });
+        let storage = stored_credentials(u64::MAX);
+        let provider =
+            cx.update(|cx| ClaudeSubscriptionProvider::new(http_client, storage.clone(), cx));
+        cx.update(|cx| provider.authenticate(cx))
+            .await
+            .expect("restored login");
+        let model = cx
+            .read(|cx| provider.default_model(cx))
+            .expect("discovered model");
+        provider.state.update(cx, |state, _| {
+            state.credentials.as_mut().expect("signed in").expires_at = 0;
+        });
+        let error = match model
+            .stream_completion(LanguageModelRequest::default(), &cx.to_async())
+            .await
+        {
+            Ok(_) => panic!("expired session must be rejected"),
+            Err(error) => error,
+        };
+        match error {
+            language_model::LanguageModelCompletionError::ProviderRejection {
+                provider,
+                status,
+                category,
+                ..
+            } => {
+                assert_eq!(provider, PROVIDER_NAME);
+                assert_eq!(status.map(|status| status.as_u16()), Some(401));
+                assert_eq!(
+                    category,
+                    language_model::ProviderErrorCategory::Authentication
+                );
+            }
+            error => panic!("unexpected error: {error:?}"),
+        }
+        assert!(!cx.read(|cx| provider.is_authenticated(cx)));
+        assert!(storage.stored.lock().is_none());
     }
 
     #[gpui::test]
