@@ -597,6 +597,11 @@ impl AutoUpdater {
         set_status: impl Fn(&str, &mut AsyncApp) + Send + 'static,
         cx: &mut AsyncApp,
     ) -> Result<PathBuf> {
+        if let Some(path) = Self::bundled_remote_server_path(os, arch, cx) {
+            set_status("Using bundled remote server", cx);
+            return Ok(path);
+        }
+
         let this = cx.update(|cx| {
             cx.default_global::<GlobalAutoUpdate>()
                 .0
@@ -646,6 +651,15 @@ impl AutoUpdater {
         Ok(version_path)
     }
 
+    /// Locally built release bundles can ship a server archive before the matching official
+    /// release exists.
+    fn bundled_remote_server_path(os: &str, arch: &str, cx: &mut AsyncApp) -> Option<PathBuf> {
+        cx.update(|cx| {
+            cx.path_for_auxiliary_executable(&format!("zed-remote-server-{os}-{arch}.gz"))
+        })
+        .ok()
+    }
+
     pub async fn get_remote_server_release_url(
         channel: ReleaseChannel,
         version: Option<Version>,
@@ -653,6 +667,10 @@ impl AutoUpdater {
         arch: &str,
         cx: &mut AsyncApp,
     ) -> Result<Option<String>> {
+        if Self::bundled_remote_server_path(os, arch, cx).is_some() {
+            return Ok(None);
+        }
+
         let this = cx.update(|cx| {
             cx.default_global::<GlobalAutoUpdate>()
                 .0
