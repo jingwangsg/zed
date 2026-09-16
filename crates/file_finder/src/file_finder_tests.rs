@@ -4483,6 +4483,42 @@ async fn test_open_without_dismiss_then_confirm_closes_finder(cx: &mut TestAppCo
 }
 
 #[gpui::test]
+async fn test_hidden_preview_does_not_open_buffers(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(path!("/root"), json!({ "report.md": "# Report" }))
+        .await;
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (_picker, _workspace, cx) = build_find_picker(project.clone(), cx);
+    cx.dispatch_action(picker::SetPreviewHidden);
+    simulate_input(cx, "report");
+    let path = project.read_with(cx, |project, cx| {
+        project
+            .find_project_path(Path::new(path!("/root/report.md")), cx)
+            .unwrap()
+    });
+    project.read_with(cx, |project, cx| {
+        assert!(
+            project.get_open_buffer(&path, cx).is_none(),
+            "hidden previews must not open matching files"
+        );
+    });
+
+    cx.dispatch_action(picker::SetPreviewRight);
+    cx.run_until_parked();
+    let buffer_is_open = project.read_with(cx, |project, cx| {
+        project.get_open_buffer(&path, cx).is_some()
+    });
+    cx.dispatch_action(picker::SetPreviewHidden);
+    assert!(
+        buffer_is_open,
+        "showing the preview must load the current selection"
+    );
+}
+
+#[gpui::test]
 async fn test_reopen_with_preview_keeps_results_width(cx: &mut TestAppContext) {
     let app_state = init_test(cx);
     app_state

@@ -40,7 +40,9 @@ impl Preview {
     }
 
     pub fn update(&mut self, update: Update, window: &mut Window, cx: &mut App) {
-        self.content.update(update, window, cx);
+        if self.layout != Layout::Hidden {
+            self.content.update(update, window, cx);
+        }
     }
 
     pub fn render(&self, cx: &mut App) -> impl IntoElement {

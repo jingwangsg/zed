@@ -1612,7 +1612,7 @@ impl<D: PickerDelegate> Picker<D> {
     fn set_preview_layout(
         &mut self,
         layout: preview::Layout,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         persistence::store_last_layout(D::name(), self.preview.as_ref().map(|_| layout), cx);
@@ -1634,6 +1634,10 @@ impl<D: PickerDelegate> Picker<D> {
             });
         self.delegate
             .preview_layout_changed(matches!(layout, preview::Layout::Right));
+        // Selection may have changed while the preview was hidden.
+        if let Some(update) = self.delegate.try_get_preview_data_for_match(cx) {
+            preview.update(update, window, cx);
+        }
         cx.notify();
     }
 }
