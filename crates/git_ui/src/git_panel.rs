@@ -112,6 +112,7 @@ const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
 // TODO: We should revise this part. It seems the indentation width is not aligned with the one in project panel
 const TREE_INDENT: f32 = 16.0;
 const MAX_HISTORY_TAG_CHIPS: usize = 3;
+const COMMIT_HISTORY_PRELOAD_COUNT: usize = 64;
 // Horizontal offset that aligns the tree indent guides with the row icon column.
 const INDENT_GUIDE_LEFT_OFFSET: gpui::Pixels = gpui::px(19.);
 
@@ -5231,6 +5232,9 @@ impl GitPanel {
             self.active_repository = active_repository;
             self.git_access = None;
             self.clear_marks();
+            // These belong to the previous repository; preload_commit_history re-subscribes
+            // only while the list is empty.
+            self._repo_subscriptions.clear();
         }
         self.entries.clear();
         self.projected_entries_by_path.clear();
@@ -7095,30 +7099,12 @@ impl GitPanel {
             }
             GitPanelTab::Changes => {
                 self.set_commit_history(CommitHistory::Loading, cx);
-                self._repo_subscriptions.clear();
             }
         }
         cx.notify();
     }
 
     fn preload_commit_history(&mut self, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.as_ref() else {
-            return;
-        };
-
-        let Some(log_source) = Self::commit_history_log_source(active_repository, cx) else {
-            return;
-        };
-        let log_order = LogOrder::DateOrder;
-
-        // Kick off the git log fetch so data is ready when the user switches to History.
-        // graph_data() is idempotent — if already loading/loaded, this is a no-op.
-        active_repository.update(cx, |repository, cx| {
-            repository.graph_data(log_source, log_order, 0..0, cx);
-        });
-    }
-
-    fn load_commit_history(&mut self, cx: &mut Context<Self>) {
         let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
@@ -7128,6 +7114,7 @@ impl GitPanel {
                 &active_repository,
                 |this, _repo, event, cx| {
                     if let RepositoryEvent::GraphEvent(_, _) = event {
+                        this.preload_commit_history(cx);
                         if this.active_tab == GitPanelTab::History {
                             this.fetch_commit_history_entries(cx);
                         }
@@ -7135,11 +7122,38 @@ impl GitPanel {
                 },
             ));
             self._repo_subscriptions
-                .push(cx.observe(&active_repository, |_this, _repo, cx| {
-                    cx.notify();
+                .push(cx.observe(&active_repository, |this, _repo, cx| {
+                    if this.active_tab == GitPanelTab::History {
+                        cx.notify();
+                    }
                 }));
         }
 
+        let Some(log_source) = Self::commit_history_log_source(&active_repository, cx) else {
+            return;
+        };
+
+        // One batch prepares the first screen without reading every commit's details.
+        active_repository.update(cx, |repository, cx| {
+            let shas = repository
+                .graph_data(
+                    log_source,
+                    LogOrder::DateOrder,
+                    0..COMMIT_HISTORY_PRELOAD_COUNT,
+                    cx,
+                )
+                .commits
+                .iter()
+                .map(|commit| commit.sha)
+                .collect::<Vec<_>>();
+            for sha in shas {
+                repository.fetch_commit_data(sha, false, cx);
+            }
+        });
+    }
+
+    fn load_commit_history(&mut self, cx: &mut Context<Self>) {
+        self.preload_commit_history(cx);
         self.fetch_commit_history_entries(cx);
     }
 
@@ -10275,6 +10289,109 @@ mod tests {
             !matches!(panel.commit_history, CommitHistory::Loading)
         })
         .await;
+    }
+
+    #[gpui::test]
+    async fn test_history_details_preload_before_panel_is_opened(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
+            .await;
+        let dot_git = Path::new(path!("/root/project/.git"));
+        let commits = (1..=65)
+            .map(|index| CommitData {
+                sha: format!("{index:040x}").parse().unwrap(),
+                parents: SmallVec::new(),
+                author_name: "Author".into(),
+                author_email: "author@example.com".into(),
+                commit_timestamp: index,
+                subject: format!("Commit {index}").into(),
+                message: format!("Commit {index}").into(),
+            })
+            .collect::<Vec<_>>();
+        fs.set_branch_name(dot_git, Some("main"));
+        fs.with_git_state(dot_git, false, |state| {
+            state.refs.insert("HEAD".into(), commits[0].sha.to_string());
+            state.graph_commits = commits
+                .iter()
+                .map(|commit| {
+                    Arc::new(InitialGraphCommitData {
+                        sha: commit.sha,
+                        parents: SmallVec::new(),
+                        ref_names: Vec::new(),
+                    })
+                })
+                .collect();
+        })
+        .unwrap();
+        fs.set_commit_data(
+            dot_git,
+            commits.iter().cloned().map(|commit| (commit, false)),
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/root/project"))], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |workspace, _| workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace.update_in(cx, GitPanel::new);
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.active_tab, GitPanelTab::Changes);
+            let repository = panel.active_repository.as_ref().unwrap().read(cx);
+            let loaded = repository.loaded_commit_data_for_test();
+            assert_eq!(loaded.len(), 64);
+            for commit in commits.iter().take(64) {
+                assert_eq!(loaded[&commit.sha].subject, commit.subject);
+                assert_eq!(loaded[&commit.sha].author_name, commit.author_name);
+            }
+            assert!(!loaded.contains_key(&commits[64].sha));
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.set_active_tab(GitPanelTab::History, window, cx);
+            panel.set_active_tab(GitPanelTab::Changes, window, cx);
+        });
+        let new_commit = CommitData {
+            sha: "ffffffffffffffffffffffffffffffffffffffff".parse().unwrap(),
+            subject: "New commit".into(),
+            ..commits[0].clone()
+        };
+        fs.set_commit_data(
+            dot_git,
+            commits
+                .iter()
+                .cloned()
+                .chain(std::iter::once(new_commit.clone()))
+                .map(|commit| (commit, false)),
+        );
+        fs.with_git_state(dot_git, true, |state| {
+            state.refs.insert("HEAD".into(), new_commit.sha.to_string());
+            state.graph_commits.insert(
+                0,
+                Arc::new(InitialGraphCommitData {
+                    sha: new_commit.sha,
+                    parents: SmallVec::new(),
+                    ref_names: Vec::new(),
+                }),
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.active_tab, GitPanelTab::Changes);
+            let repository = panel.active_repository.as_ref().unwrap().read(cx);
+            let loaded = repository.loaded_commit_data_for_test();
+            assert_eq!(loaded[&new_commit.sha].subject, new_commit.subject);
+            assert!(!loaded.contains_key(&commits[64].sha));
+        });
     }
 
     #[gpui::test]
