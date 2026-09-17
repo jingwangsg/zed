@@ -160,6 +160,7 @@ pub trait RemoteClientDelegate: Send + Sync {
 const MAX_MISSED_HEARTBEATS: usize = 5;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+const RECONNECT_RETRY_DELAY: Duration = Duration::from_secs(10);
 const INITIAL_CONNECTION_TIMEOUT: Duration =
     Duration::from_secs(if cfg!(debug_assertions) { 5 } else { 60 });
 
@@ -674,6 +675,13 @@ impl RemoteClient {
             {
                 failed!(error, attempts, remote_connection, delegate);
             };
+
+            if attempts > 1 {
+                // SSH proxies may still be restarting after the first connection failure.
+                cx.background_executor()
+                    .timer(RECONNECT_RETRY_DELAY * (attempts - 1) as u32)
+                    .await;
+            }
 
             let connection_options = remote_connection.connection_options();
 
@@ -1441,6 +1449,50 @@ mod tests {
             .connection_type(),
             "podman"
         );
+    }
+
+    #[gpui::test]
+    async fn test_reconnect_waits_after_failed_attempts(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| release_channel::init(Version::new(0, 0, 0), cx));
+        server_cx.update(|cx| release_channel::init(Version::new(0, 0, 0), cx));
+        let (options, server, guard) = RemoteClient::fake_server(cx, server_cx);
+        let handler = server_cx.new(|_| ());
+        server.add_request_handler::<proto::Ping, _, _, _>(handler.downgrade(), |_, _, _| async {
+            Ok(proto::Ack {})
+        });
+        drop(guard);
+        let client = RemoteClient::connect_mock(options, cx).await;
+        for (failed_attempts, delay_seconds) in [(1, 10), (2, 20)] {
+            client.update(cx, |client, cx| {
+                client.force_heartbeat_timeout(failed_attempts, cx)
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                client.read_with(cx, |client, _| client.connection_state()),
+                ConnectionState::Reconnecting
+            );
+            cx.executor()
+                .advance_clock(Duration::from_secs(delay_seconds - 1));
+            cx.run_until_parked();
+            assert_eq!(
+                client.read_with(cx, |client, _| client.connection_state()),
+                ConnectionState::Reconnecting
+            );
+            cx.executor().advance_clock(Duration::from_secs(1));
+            cx.run_until_parked();
+            assert_eq!(
+                client.read_with(cx, |client, _| client.connection_state()),
+                ConnectionState::Connected
+            );
+            client
+                .read_with(cx, |client, _| client.proto_client())
+                .request(proto::Ping {})
+                .await
+                .unwrap();
+        }
     }
 
     #[gpui::test]
