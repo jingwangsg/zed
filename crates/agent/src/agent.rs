@@ -850,6 +850,35 @@ impl NativeAgent {
         });
 
         let subscriptions = vec![
+            cx.subscribe(&acp_thread, {
+                let thread = thread_handle.clone();
+                move |_, acp_thread, event, cx| {
+                    if !matches!(event, acp_thread::AcpThreadEvent::NewEntry)
+                        || thread.read(cx).last_message().is_some()
+                    {
+                        return;
+                    }
+                    let acp_thread = acp_thread.read(cx);
+                    let Some(acp_thread::AgentThreadEntry::UserMessage(message)) =
+                        acp_thread.entries().last()
+                    else {
+                        return;
+                    };
+                    let Some(id) = message.client_id.clone().filter(|_| message.is_optimistic)
+                    else {
+                        return;
+                    };
+                    let path_style = project.read(cx).path_style(cx);
+                    let content = message
+                        .chunks
+                        .iter()
+                        .cloned()
+                        .map(|block| UserMessageContent::from_content_block(block, path_style))
+                        .collect();
+                    // The first prompt must survive cancellation while the Git checkpoint is pending.
+                    thread.update(cx, |thread, cx| thread.record_user_message(id, content, cx));
+                }
+            }),
             cx.subscribe(&thread_handle, Self::handle_thread_title_updated),
             cx.subscribe(&thread_handle, Self::handle_thread_token_usage_updated),
             cx.observe(&thread_handle, move |this, thread, cx| {
@@ -1641,11 +1670,11 @@ impl NativeAgent {
         project: Entity<Project>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Thread>>> {
-        let database_future = ThreadsDatabase::connect(cx);
+        let load = self
+            .thread_store
+            .update(cx, |store, cx| store.load_thread(id.clone(), cx));
         cx.spawn(async move |this, cx| {
-            let database = database_future.await.map_err(|err| anyhow!(err))?;
-            let db_thread = database
-                .load_thread(id.clone())
+            let db_thread = load
                 .await?
                 .with_context(|| format!("no thread found with ID: {id:?}"))?;
 
@@ -1790,7 +1819,9 @@ impl NativeAgent {
             return;
         };
         let project_id = session.project_id;
-        session.save_worker.detach_and_log_err(cx);
+        self.thread_store.update(cx, |store, cx| {
+            store.finish_session_save(session_id.clone(), session.save_worker, cx);
+        });
 
         let has_remaining = self.sessions.values().any(|s| s.project_id == project_id);
         if !has_remaining {
@@ -6716,6 +6747,70 @@ mod internal_tests {
                 .expect("scroll position should be restored after reload");
             assert_eq!(scroll.item_ix, 5);
             assert_eq!(scroll.offset_in_item, gpui::px(12.5));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_reopen_session_cancelled_before_prompt(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({".git": {}, "file.txt": "hello"}))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx.update(|cx| NativeAgent::new(store, Templates::new(), fs, cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let acp_thread = cx
+            .update(|cx| connection.new_session(project.clone(), PathList::default(), cx))
+            .await
+            .unwrap();
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let native_thread =
+            agent.read_with(cx, |agent, _| agent.sessions[&session_id].thread.clone());
+        let _cancel = cx.update(|cx| {
+            cx.subscribe(&acp_thread, |thread, event, cx| {
+                if matches!(event, acp_thread::AcpThreadEvent::NewEntry) {
+                    drop(thread.update(cx, |thread, cx| thread.cancel(cx)));
+                }
+            })
+        });
+        let database = cx.update(|cx| ThreadsDatabase::connect(cx)).await.unwrap();
+        let (save_ready, save_gate) = oneshot::channel();
+        database.set_write_gate(save_gate);
+        let send = acp_thread.update(cx, |thread, cx| {
+            thread.send(vec!["Keep this prompt".into()], cx)
+        });
+        assert!(send.await.unwrap().is_none());
+        assert!(!acp_thread.read_with(cx, |thread, _| thread.entries().is_empty()));
+        drop(native_thread);
+        drop(acp_thread);
+        release_dropped_entities(cx);
+        let mut reopen = agent.update(cx, |agent, cx| agent.open_thread(session_id, project, cx));
+        cx.run_until_parked();
+        assert!(
+            (&mut reopen).now_or_never().is_none(),
+            "reopening must wait for the closing session to save"
+        );
+        save_ready.send(()).unwrap();
+        let reopened = reopen
+            .await
+            .expect("cancelled session should remain loadable");
+        reopened.read_with(cx, |thread, _| {
+            let messages = thread
+                .entries()
+                .iter()
+                .filter_map(|entry| {
+                    if let acp_thread::AgentThreadEntry::UserMessage(message) = entry {
+                        Some(&message.chunks)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                messages,
+                vec![&vec![acp::ContentBlock::from("Keep this prompt")]]
+            );
         });
     }
 

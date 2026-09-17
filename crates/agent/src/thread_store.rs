@@ -1,9 +1,13 @@
 use crate::{DbThread, DbThreadMetadata, ThreadsDatabase};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Result, anyhow};
-use futures::{FutureExt, future::Shared};
+use collections::HashMap;
+use futures::{
+    FutureExt,
+    future::{Shared, WeakShared},
+};
 use gpui::{App, Context, Entity, Global, Task, prelude::*};
-use util::path_list::PathList;
+use util::{ResultExt as _, path_list::PathList};
 
 struct GlobalThreadStore(Entity<ThreadStore>);
 
@@ -12,6 +16,7 @@ impl Global for GlobalThreadStore {}
 pub struct ThreadStore {
     threads: Vec<DbThreadMetadata>,
     reload_task: Shared<Task<()>>,
+    pending_saves: HashMap<acp::SessionId, WeakShared<Task<()>>>,
 }
 
 impl ThreadStore {
@@ -33,6 +38,7 @@ impl ThreadStore {
         Self {
             threads: Vec::new(),
             reload_task,
+            pending_saves: HashMap::default(),
         }
     }
 
@@ -47,13 +53,43 @@ impl ThreadStore {
         self.threads.iter().find(|thread| &thread.id == session_id)
     }
 
+    pub(crate) fn finish_session_save(
+        &mut self,
+        id: acp::SessionId,
+        save: Task<Result<()>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_saves
+            .retain(|_, save| save.upgrade().is_some());
+        let previous = self
+            .pending_saves
+            .remove(&id)
+            .and_then(|save| save.upgrade());
+        let save = cx
+            .background_spawn(async move {
+                if let Some(previous) = previous {
+                    previous.await;
+                }
+                save.await.log_err();
+            })
+            .shared();
+        if let Some(pending) = save.downgrade() {
+            self.pending_saves.insert(id, pending);
+        }
+        cx.background_spawn(save).detach();
+    }
+
     pub fn load_thread(
         &mut self,
         id: acp::SessionId,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<DbThread>>> {
+        let pending_save = self.pending_saves.get(&id).and_then(|save| save.upgrade());
         let database_future = ThreadsDatabase::connect(cx);
         cx.background_spawn(async move {
+            if let Some(pending_save) = pending_save {
+                pending_save.await;
+            }
             let database = database_future.await.map_err(|err| anyhow!(err))?;
             database.load_thread(id).await
         })

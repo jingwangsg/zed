@@ -2533,11 +2533,27 @@ impl Thread {
         let content = content.into_iter().map(Into::into).collect::<Arc<_>>();
         log::debug!("Thread::send content: {:?}", content);
 
-        self.messages
-            .push(Arc::new(Message::User(UserMessage { id, content })));
-        cx.notify();
-
+        self.record_user_message(id, content, cx);
         self.send_existing(cx)
+    }
+
+    pub(crate) fn record_user_message(
+        &mut self,
+        id: ClientUserMessageId,
+        content: Arc<[UserMessageContent]>,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = self
+            .messages
+            .iter_mut()
+            .find(|message| matches!(message.as_ref(), Message::User(message) if message.id == id));
+        let message = Arc::new(Message::User(UserMessage { id, content }));
+        if let Some(existing) = existing {
+            *existing = message;
+        } else {
+            self.messages.push(message);
+        }
+        cx.notify();
     }
 
     pub fn send_existing(
