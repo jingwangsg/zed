@@ -156,12 +156,12 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput, outline};
 /// - This tool supports reading image files. Supported formats: PNG, JPEG, WebP, GIF, BMP, TIFF.
 ///   Image files are returned as visual content that you can analyze directly.
 ///
-/// The only supported path outside the project is `~/.agents/skills` or a descendant, for global agent skills.
+/// Outside-project paths are limited to global skills under `~/.agents/skills`, built-in skill resources, and `.canvas.tsx` files in the system-provided managed Canvas directory.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ReadFileToolInput {
     /// The relative path of the file to read.
     ///
-    /// This path should never be absolute, and the first component of the path should always be a root directory in a project, unless it's a global agent skill under `~/.agents/skills`.
+    /// This path should never be absolute, and the first component of the path should always be a root directory in a project, unless it is a global skill or a file in the system-provided managed Canvas directory.
     ///
     /// <example>
     /// If the project has the following root directories:
@@ -256,6 +256,58 @@ impl AgentTool for ReadFileTool {
                 .await
                 .map_err(tool_content_err)?;
             let fs = project.read_with(cx, |project, _cx| project.fs().clone());
+
+            if let Some(content) = agent_skills::builtin_skill_content(Path::new(&input.path)) {
+                let start = input.start_line.unwrap_or(1).saturating_sub(1) as usize;
+                let end = input.end_line.map(|line| line as usize).unwrap_or(usize::MAX);
+                let text = content
+                    .lines()
+                    .enumerate()
+                    .skip(start)
+                    .take(end.saturating_sub(start))
+                    .map(|(index, line)| format!("{:>6}\t{}", index + 1, line))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Ok(text.into());
+            }
+            let canvas_path = cx
+                .update(|cx| {
+                    crate::canvas::resolve_path(project.read(cx), Path::new(&input.path), cx)
+                })
+                .await
+                .map_err(tool_content_err)?;
+            if let Some(path) = canvas_path {
+                let contents = read_global_skill_file(
+                    &path,
+                    fs.as_ref(),
+                    input.start_line,
+                    input.end_line,
+                    &input.path,
+                    &event_stream,
+                )
+                .await?;
+                let status = cx
+                    .update(|cx| -> anyhow::Result<Option<String>> {
+                        let database = agent_canvas::CanvasDb::global(cx);
+                        let Some(id) = database.by_path(path.to_string_lossy().into_owned())? else {
+                            return Ok(None);
+                        };
+                        let record = database.get(&id)?;
+                        let Some(store) = agent_canvas::CanvasStore::global(cx) else {
+                            return Ok(None);
+                        };
+                        Ok(Some(serde_json::to_string(
+                            &store.read(cx).preview_status(&record),
+                        )?))
+                    })
+                    .map_err(tool_content_err)?;
+                return Ok(match (contents, status) {
+                    (LanguageModelToolResultContent::Text(text), Some(status)) => {
+                        format!("{text}\n\nCanvas preview: {status}").into()
+                    }
+                    (contents, _) => contents,
+                });
+            }
 
             // Fast path: if the model passes a path that resolves under the
             // global skills directory, read it directly via the

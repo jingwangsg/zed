@@ -1,0 +1,2 @@
+/node_modules/
+!/dist/esbuild/esbuild.wasm

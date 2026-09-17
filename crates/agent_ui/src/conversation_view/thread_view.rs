@@ -10321,7 +10321,9 @@ impl ThreadView {
             return Empty.into_any_element();
         };
 
-        let label: SharedString = if let Some(abs_path) = is_file {
+        let label: SharedString = if resource_link.uri.ends_with(".canvas.tsx") {
+            format!("Canvas: {}", resource_link.name).into()
+        } else if let Some(abs_path) = is_file {
             // Split off an optional `#L<line>` fragment so the path still resolves.
             let (abs_path, fragment) = abs_path
                 .split_once('#')
@@ -12508,6 +12510,27 @@ pub(crate) fn open_link(
     window: &mut Window,
     cx: &mut App,
 ) {
+    #[cfg(target_os = "macos")]
+    {
+        let url = url.trim_start_matches('\u{200b}');
+        let path = if url.starts_with("file://") {
+            url::Url::parse(url)
+                .ok()
+                .and_then(|url| url.to_file_path().ok())
+        } else {
+            Some(std::path::PathBuf::from(url))
+        };
+        if let Some(path) = path.filter(|path| path.to_string_lossy().ends_with(".canvas.tsx")) {
+            match agent_canvas::CanvasDb::global(cx).by_path(path.to_string_lossy().into_owned()) {
+                Ok(Some(id)) => {
+                    crate::canvas::open(&id, workspace, window, cx);
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => log::error!("Looking up Canvas link: {error:#}"),
+            }
+        }
+    }
     let Some(workspace) = workspace.upgrade() else {
         cx.open_url(&url);
         return;

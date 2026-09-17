@@ -6,6 +6,7 @@ members = [
     "crates/action_log",
     "crates/activity_indicator",
     "crates/agent",
+    "crates/agent_canvas",
     "crates/agent_servers",
     "crates/agent_settings",
     "crates/agent_skills",
@@ -99,6 +100,7 @@ members = [
     "crates/gpui_tokio",
     "crates/gpui_util",
     "crates/gpui_web",
+    "crates/gpui_webview",
     "crates/gpui_wgpu",
     "crates/gpui_windows",
     "crates/grammars",
@@ -281,6 +283,7 @@ acp_tools = { path = "crates/acp_tools" }
 action_log = { path = "crates/action_log" }
 activity_indicator = { path = "crates/activity_indicator" }
 agent = { path = "crates/agent" }
+agent_canvas = { path = "crates/agent_canvas" }
 agent_servers = { path = "crates/agent_servers" }
 agent_settings = { path = "crates/agent_settings" }
 agent_skills = { path = "crates/agent_skills" }
@@ -367,6 +370,7 @@ gpui_shared_string = { path = "crates/gpui_shared_string" }
 gpui_tokio = { path = "crates/gpui_tokio" }
 gpui_util = { path = "crates/gpui_util" }
 gpui_web = { path = "crates/gpui_web" }
+gpui_webview = { path = "crates/gpui_webview" }
 gpui_wgpu = { path = "crates/gpui_wgpu" }
 gpui_windows = { path = "crates/gpui_windows", default-features = false }
 grammars = { path = "crates/grammars" }
@@ -714,6 +718,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "block2",
     "objc2-core-foundation",
 ] }
+objc2-core-graphics = "=0.3.2"
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "NSArray",
     "NSAttributedString",
@@ -740,6 +745,7 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "objc2-core-foundation",
     "std",
 ] }
+objc2-quartz-core = "=0.3.2"
 objc2-screen-capture-kit = { version = "=0.3.2", default-features = false, features = [
     "block2",
     "objc2-core-graphics",
@@ -747,6 +753,7 @@ objc2-screen-capture-kit = { version = "=0.3.2", default-features = false, featu
     "std"
 ] }
 objc2-user-notifications = "0.3"
+objc2-web-kit = "=0.3.2"
 open = "5.0.0"
 ordered-float = "5"
 palette = { version = "0.7.5", default-features = false, features = ["std"] }

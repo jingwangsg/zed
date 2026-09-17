@@ -23,12 +23,12 @@ const DEFAULT_UI_TEXT: &str = "Writing file";
 ///
 /// Before using this tool, verify the directory path is correct (only applicable when creating new files). Use the `list_directory` tool to verify the parent directory exists and is the correct location
 ///
-/// The only supported path outside the project is `~/.agents/skills` or a descendant, for global agent skills.
+/// Outside-project paths are limited to global skills under `~/.agents/skills` and `.canvas.tsx` files in the system-provided managed Canvas directory.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct WriteFileToolInput {
     /// The full path of the file to create or overwrite in the project.
     ///
-    /// WARNING: When specifying which file path need changing, you MUST start each path with one of the project's root directories, unless it's a global agent skill under `~/.agents/skills`.
+    /// WARNING: When specifying which file path need changing, you MUST start each path with one of the project's root directories, unless it is a global skill or a file in the system-provided managed Canvas directory.
     ///
     /// The following examples assume we have two root directories in the project:
     /// - /a/b/backend
@@ -1365,6 +1365,332 @@ mod tests {
         assert!(!buffer.read_with(cx, |buffer, _| buffer.is_dirty()));
         let on_disk = fs.load(path!("/root/file.txt").as_ref()).await.unwrap();
         assert_eq!(on_disk, "on disk content plus user edit");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_canvas_ask_write_is_scoped(cx: &mut TestAppContext) {
+        let (tool, project, action_log, fs, thread) =
+            setup_test(cx, json!({"keep.txt": "unchanged"})).await;
+        cx.update(|cx| {
+            agent_canvas::CanvasStore::init(
+                node_runtime::NodeRuntime::unavailable(),
+                fs.clone(),
+                cx,
+            );
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        thread.update(cx, |thread, cx| {
+            thread.set_profile(agent_settings::AgentProfileId("ask".into()), cx)
+        });
+        let blocked = cx
+            .update(|cx| {
+                tool.clone().run(
+                    ToolInput::resolved(WriteFileToolInput {
+                        path: "root/keep.txt".into(),
+                        content: "changed".into(),
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await;
+        assert!(blocked.unwrap_err().to_string().contains("Ask mode"));
+        assert_eq!(
+            fs.load(path!("/root/keep.txt").as_ref()).await.unwrap(),
+            "unchanged"
+        );
+        let directory = project.read_with(cx, |project, cx| {
+            crate::canvas::directory(project, cx).unwrap()
+        });
+        let path = directory.join("report.canvas.tsx");
+        let source = "import {H1} from '@zed/canvas'; export default function Report() { return <H1>Measured results</H1>; }";
+        let written = cx
+            .update(|cx| {
+                tool.clone().run(
+                    ToolInput::resolved(WriteFileToolInput {
+                        path: path.clone(),
+                        content: source.into(),
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(matches!(written, EditSessionOutput::Canvas { .. }));
+        assert_eq!(fs.load(&path).await.unwrap(), source);
+        // The file is saved even when the test's deliberately unavailable compiler returns diagnostics.
+        assert!(written.to_string().contains("Node runtime"));
+        let read_tool = Arc::new(crate::ReadFileTool::new(
+            project.clone(),
+            action_log.clone(),
+            true,
+        ));
+        for (path, expected) in [
+            (path.to_string_lossy().into_owned(), "Measured results"),
+            ("<built-in>/canvas/sdk.d.ts".into(), "useCanvasState"),
+        ] {
+            let contents = cx
+                .update(|cx| {
+                    read_tool.clone().run(
+                        ToolInput::resolved(crate::ReadFileToolInput {
+                            path,
+                            start_line: None,
+                            end_line: None,
+                        }),
+                        ToolCallEventStream::test().0,
+                        cx,
+                    )
+                })
+                .await
+                .unwrap();
+            let language_model::LanguageModelToolResultContent::Text(text) = contents else {
+                panic!("Expected Canvas source text");
+            };
+            assert!(text.contains(expected));
+        }
+        let edit_tool = Arc::new(crate::EditFileTool::new(
+            project.clone(),
+            thread.downgrade(),
+            action_log,
+            project.read_with(cx, |project, _| project.languages().clone()),
+        ));
+        let edited = cx
+            .update(|cx| {
+                edit_tool.run(
+                    ToolInput::resolved(crate::EditFileToolInput {
+                        path: path.clone(),
+                        edits: vec![crate::Edit {
+                            old_text: "Measured results".into(),
+                            new_text: "Updated results".into(),
+                        }],
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            edited,
+            EditSessionOutput::Canvas { revision: 2, .. }
+        ));
+        assert_eq!(
+            fs.load(&path).await.unwrap(),
+            source.replace("Measured results", "Updated results")
+        );
+        let escape = directory.join("../outside.canvas.tsx");
+        let denied = cx
+            .update(|cx| crate::canvas::resolve_path(project.read(cx), &escape, cx))
+            .await;
+        assert!(denied.is_err());
+        fs.create_symlink(
+            &directory.join("linked.canvas.tsx"),
+            PathBuf::from(path!("/root/keep.txt")),
+        )
+        .await
+        .unwrap();
+        let denied = cx
+            .update(|cx| {
+                crate::canvas::resolve_path(
+                    project.read(cx),
+                    &directory.join("linked.canvas.tsx"),
+                    cx,
+                )
+            })
+            .await;
+        assert!(denied.is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_canvas_write_in_remote_project(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (_, local_project, _, fs, _) = setup_test(cx, json!({})).await;
+        cx.update(|cx| release_channel::init("0.0.0".parse().unwrap(), cx));
+        server_cx.update(|cx| release_channel::init("0.0.0".parse().unwrap(), cx));
+        let (options, server, guard) = remote::RemoteClient::fake_server(cx, server_cx);
+        let requests = server_cx.new(|_| Vec::<String>::new());
+        server.add_request_handler::<rpc::proto::Ping, _, _, _>(
+            requests.downgrade(),
+            |_, _, _| async { Ok(rpc::proto::Ack {}) },
+        );
+        server.add_request_handler::<rpc::proto::AddWorktree, _, _, _>(
+            requests.downgrade(),
+            |requests, request, mut cx| async move {
+                requests.update(&mut cx, |requests, _| {
+                    requests.push(request.payload.path.clone())
+                });
+                anyhow::bail!(
+                    "Client-local Canvas path sent to remote server: {}",
+                    request.payload.path
+                )
+            },
+        );
+        drop(guard);
+        let remote = remote::RemoteClient::connect_mock(options, cx).await;
+        let project = cx.update(|cx| {
+            let local = local_project.read(cx);
+            Project::remote(
+                remote,
+                local.client(),
+                node_runtime::NodeRuntime::unavailable(),
+                local.user_store(),
+                local.languages().clone(),
+                fs.clone(),
+                false,
+                cx,
+            )
+        });
+        let registry =
+            cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
+        let thread = cx.new(|cx| {
+            crate::Thread::new(
+                project.clone(),
+                cx.new(|_| ProjectContext::default()),
+                registry,
+                Templates::new(),
+                Some(Arc::new(FakeLanguageModel::default())),
+                cx,
+            )
+        });
+        cx.update(|cx| {
+            agent_canvas::CanvasStore::init(
+                node_runtime::NodeRuntime::unavailable(),
+                fs.clone(),
+                cx,
+            );
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
+        thread.update(cx, |thread, cx| {
+            thread.set_profile(agent_settings::AgentProfileId("ask".into()), cx)
+        });
+        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
+        let languages = project.read_with(cx, |project, _| project.languages().clone());
+        let tool = Arc::new(WriteFileTool::new(
+            project.clone(),
+            thread.downgrade(),
+            action_log.clone(),
+            languages.clone(),
+        ));
+        let path = project.read_with(cx, |project, cx| {
+            crate::canvas::directory(project, cx)
+                .unwrap()
+                .join("remote.canvas.tsx")
+        });
+        let source = "export default function Report() { return <h1>Remote workspace</h1>; }";
+        let output = cx
+            .update(|cx| {
+                tool.clone().run(
+                    ToolInput::resolved(WriteFileToolInput {
+                        path: path.clone(),
+                        content: source.into(),
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(matches!(output, EditSessionOutput::Canvas { .. }));
+        assert_eq!(fs.load(&path).await.unwrap(), source);
+        let read = Arc::new(crate::ReadFileTool::new(
+            project.clone(),
+            action_log.clone(),
+            true,
+        ));
+        let output = cx
+            .update(|cx| {
+                read.run(
+                    ToolInput::resolved(crate::ReadFileToolInput {
+                        path: path.to_string_lossy().into_owned(),
+                        start_line: None,
+                        end_line: None,
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let language_model::LanguageModelToolResultContent::Text(text) = output else {
+            panic!("Expected Canvas source");
+        };
+        assert!(text.contains("Remote workspace"));
+        cx.run_until_parked();
+        action_log.update(cx, |log, cx| log.keep_all_edits(None, cx));
+        let edit = Arc::new(crate::EditFileTool::new(
+            project.clone(),
+            thread.downgrade(),
+            action_log.clone(),
+            languages,
+        ));
+        let output = cx
+            .update(|cx| {
+                edit.run(
+                    ToolInput::resolved(crate::EditFileToolInput {
+                        path: path.clone(),
+                        edits: vec![crate::Edit {
+                            old_text: "Remote workspace".into(),
+                            new_text: "Updated locally".into(),
+                        }],
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            output,
+            EditSessionOutput::Canvas { revision: 2, .. }
+        ));
+        assert_eq!(
+            fs.load(&path).await.unwrap(),
+            source.replace("Remote workspace", "Updated locally")
+        );
+        assert_eq!(
+            project.read_with(cx, |project, cx| project.worktrees(cx).count()),
+            0
+        );
+        cx.run_until_parked();
+        action_log
+            .update(cx, |log, cx| log.reject_all_edits(None, cx))
+            .await;
+        assert_eq!(fs.load(&path).await.unwrap(), source);
+        action_log
+            .update(cx, |log, cx| log.undo_last_reject(cx))
+            .await;
+        assert_eq!(
+            fs.load(&path).await.unwrap(),
+            source.replace("Remote workspace", "Updated locally")
+        );
+        let discard_path = path.with_file_name("discard.canvas.tsx");
+        cx.update(|cx| {
+            tool.run(
+                ToolInput::resolved(WriteFileToolInput {
+                    path: discard_path.clone(),
+                    content: source.into(),
+                }),
+                ToolCallEventStream::test().0,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+        cx.run_until_parked();
+        action_log
+            .update(cx, |log, cx| log.reject_all_edits(None, cx))
+            .await;
+        assert!(fs.metadata(&discard_path).await.unwrap().is_none());
+        assert!(requests.read_with(server_cx, |requests, _| requests.is_empty()));
     }
 
     async fn setup_test_with_fs(

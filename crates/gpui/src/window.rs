@@ -752,7 +752,7 @@ pub enum WindowControlArea {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct HitboxId(u64);
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 impl HitboxId {
     /// A placeholder HitboxId exclusively for integration testing API's that
     /// need a hitbox but where the value of the hitbox does not matter. The
@@ -984,6 +984,7 @@ pub(crate) struct Frame {
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
+    native_views: Vec<crate::NativeViewPlacement>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
@@ -1011,6 +1012,7 @@ pub(crate) struct PrepaintStateIndex {
 #[derive(Clone, Default)]
 pub(crate) struct PaintIndex {
     scene_index: usize,
+    native_views_index: usize,
     mouse_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
@@ -1030,6 +1032,7 @@ impl Frame {
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
+            native_views: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
@@ -1058,6 +1061,7 @@ impl Frame {
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
         self.hitboxes.clear();
+        self.native_views.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
@@ -3226,6 +3230,32 @@ impl Window {
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
+        for placement in &self.rendered_frame.native_views {
+            if !self
+                .next_frame
+                .native_views
+                .iter()
+                .any(|next| Rc::ptr_eq(&next.view, &placement.view))
+            {
+                placement.view.hide();
+            }
+        }
+        for placement in &self.next_frame.native_views {
+            if let Some(index) = self
+                .next_frame
+                .hitboxes
+                .iter()
+                .position(|hitbox| hitbox.id == placement.hitbox.id)
+            {
+                let regions = crate::native_view_regions(
+                    &placement.hitbox,
+                    &self.next_frame.hitboxes[index + 1..],
+                );
+                placement.view.set_frame(placement.hitbox.bounds, &regions);
+            } else {
+                placement.view.hide();
+            }
+        }
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
@@ -3751,6 +3781,7 @@ impl Window {
     pub(crate) fn paint_index(&self) -> PaintIndex {
         PaintIndex {
             scene_index: self.next_frame.scene.len(),
+            native_views_index: self.next_frame.native_views.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
@@ -3761,6 +3792,12 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        self.next_frame.native_views.extend(
+            self.rendered_frame.native_views
+                [range.start.native_views_index..range.end.native_views_index]
+                .iter()
+                .cloned(),
+        );
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
@@ -5025,6 +5062,17 @@ impl Window {
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
+    }
+
+    pub(crate) fn paint_native_view(
+        &mut self,
+        view: Rc<dyn crate::PlatformNativeView>,
+        hitbox: Hitbox,
+    ) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame
+            .native_views
+            .push(crate::NativeViewPlacement { view, hitbox });
     }
 
     /// Set a hitbox which will act as a control area of the platform window.

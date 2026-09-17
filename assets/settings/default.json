@@ -1292,6 +1292,8 @@
         // We don't know which of the context server tools are safe for the "Ask" profile, so we don't enable them by default.
         // "enable_all_context_servers": true,
         "tools": {
+          "write_file": true,
+          "edit_file": true,
           "create_thread": true,
           "diagnostics": true,
           "ask_user": false,

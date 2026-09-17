@@ -38,6 +38,7 @@ pub trait Template: Sized {
 
 #[derive(Serialize)]
 pub struct SystemPromptTemplate<'a> {
+    pub canvas_directory: Option<String>,
     #[serde(flatten)]
     pub project: &'a prompt_store::ProjectContext,
     pub available_tools: Vec<SharedString>,
@@ -100,6 +101,7 @@ mod tests {
     fn test_system_prompt_template() {
         let project = prompt_store::ProjectContext::default();
         let template = SystemPromptTemplate {
+            canvas_directory: None,
             project: &project,
             available_tools: vec!["echo".into()],
             model_name: Some("test-model".to_string()),
@@ -133,6 +135,7 @@ mod tests {
         }];
         let project = ProjectContext::new(worktrees);
         let template = SystemPromptTemplate {
+            canvas_directory: None,
             project: &project,
             available_tools: vec!["echo".into()],
             model_name: Some("test-model".to_string()),
@@ -162,6 +165,7 @@ mod tests {
     fn test_system_prompt_omits_sandbox_section_when_sandboxing_disabled() {
         let project = prompt_store::ProjectContext::default();
         let template = SystemPromptTemplate {
+            canvas_directory: None,
             project: &project,
             available_tools: vec!["echo".into()],
             model_name: Some("test-model".to_string()),
@@ -195,6 +199,7 @@ mod tests {
         ];
         let project = ProjectContext::new(worktrees);
         let template = SystemPromptTemplate {
+            canvas_directory: None,
             project: &project,
             available_tools: vec!["echo".into(), "terminal".into()],
             model_name: Some("test-model".to_string()),
@@ -238,6 +243,7 @@ mod tests {
         }];
         let project = ProjectContext::new(worktrees);
         let template = SystemPromptTemplate {
+            canvas_directory: None,
             project: &project,
             available_tools: vec!["echo".into(), "terminal".into()],
             model_name: Some("test-model".to_string()),
@@ -271,6 +277,7 @@ mod tests {
         }];
         let project = ProjectContext::new(worktrees);
         let template = SystemPromptTemplate {
+            canvas_directory: None,
             project: &project,
             available_tools: vec!["echo".into(), "terminal".into()],
             model_name: Some("test-model".to_string()),
@@ -301,6 +308,7 @@ mod tests {
     fn test_system_prompt_sandbox_section_handles_zero_worktrees() {
         let project = prompt_store::ProjectContext::default();
         let template = SystemPromptTemplate {
+            canvas_directory: None,
             project: &project,
             available_tools: vec!["echo".into(), "terminal".into()],
             model_name: Some("test-model".to_string()),
@@ -323,6 +331,7 @@ mod tests {
         // describe a sandboxed `terminal` tool the model doesn't have.
         let project = prompt_store::ProjectContext::default();
         let template = SystemPromptTemplate {
+            canvas_directory: None,
             project: &project,
             available_tools: vec!["echo".into()],
             model_name: Some("test-model".to_string()),
@@ -343,6 +352,7 @@ mod tests {
     fn test_system_prompt_omits_user_agents_md_section_when_absent() {
         let project = prompt_store::ProjectContext::default();
         let template = SystemPromptTemplate {
+            canvas_directory: None,
             project: &project,
             available_tools: vec!["echo".into()],
             model_name: Some("test-model".to_string()),
@@ -361,6 +371,7 @@ mod tests {
     fn test_system_prompt_does_not_render_legacy_zed_rules_section() {
         let project = prompt_store::ProjectContext::default();
         let template = SystemPromptTemplate {
+            canvas_directory: None,
             project: &project,
             available_tools: vec!["echo".into()],
             model_name: Some("test-model".to_string()),

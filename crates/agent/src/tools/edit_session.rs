@@ -66,6 +66,12 @@ pub struct PartialEdit {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EditSessionOutput {
+    Canvas {
+        canvas_path: PathBuf,
+        title: String,
+        revision: i64,
+        check: String,
+    },
     Success {
         #[serde(alias = "original_path")]
         input_path: PathBuf,
@@ -96,6 +102,11 @@ impl EditSessionOutput {
 impl std::fmt::Display for EditSessionOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            EditSessionOutput::Canvas {
+                canvas_path, check, ..
+            } => {
+                write!(f, "Saved {}\n\n{}", canvas_path.display(), check)
+            }
             EditSessionOutput::Success {
                 diff, input_path, ..
             } => {
@@ -183,14 +194,19 @@ impl EditSessionContext {
         }
     }
 
-    async fn ensure_buffer_saved(&self, buffer: &Entity<Buffer>, cx: &mut AsyncApp) {
+    async fn ensure_buffer_saved(
+        &self,
+        project: &Entity<Project>,
+        buffer: &Entity<Buffer>,
+        cx: &mut AsyncApp,
+    ) {
         let format_on_save_enabled = buffer.read_with(cx, |buffer, cx| {
             let settings = language_settings::LanguageSettings::for_buffer(buffer, cx);
             settings.format_on_save != FormatOnSave::Off
         });
 
         if format_on_save_enabled {
-            self.project
+            project
                 .update(cx, |project, cx| {
                     project.format(
                         HashSet::from_iter([buffer.clone()]),
@@ -204,7 +220,7 @@ impl EditSessionContext {
                 .log_err();
         }
 
-        self.project
+        project
             .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
             .await
             .log_err();
@@ -242,6 +258,22 @@ impl EditSessionContext {
         cx: &mut App,
     ) -> Result<()> {
         match output {
+            EditSessionOutput::Canvas {
+                canvas_path,
+                title,
+                check,
+                ..
+            } => {
+                event_stream.update_fields(acp::ToolCallUpdateFields::new().content(vec![
+                        acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+                            title,
+                            canvas_path.to_string_lossy().into_owned(),
+                        ))
+                        .into(),
+                        acp::ContentBlock::Text(acp::TextContent::new(check)).into(),
+                    ]));
+                Ok(())
+            }
             EditSessionOutput::Success {
                 input_path,
                 old_text,
@@ -281,9 +313,71 @@ pub(crate) async fn run_session(
         EditSessionResult::Completed(session) => {
             session
                 .context
-                .ensure_buffer_saved(&session.buffer, cx)
+                .ensure_buffer_saved(&session.buffer_project, &session.buffer, cx)
                 .await;
             let (new_text, diff) = session.compute_new_text_and_diff(cx).await;
+            let canvas = cx
+                .update(|cx| {
+                    crate::canvas::resolve_path(
+                        session.context.project.read(cx),
+                        &session.abs_path,
+                        cx,
+                    )
+                })
+                .await
+                .map_err(|error| EditSessionOutput::error(error.to_string()))?;
+            if let Some(path) = canvas {
+                let fs = session
+                    .context
+                    .project
+                    .read_with(cx, |project, _| project.fs().clone());
+                let saved = fs
+                    .load(&path)
+                    .await
+                    .map_err(|error| EditSessionOutput::error(error.to_string()))?;
+                if saved != new_text {
+                    return Err(EditSessionOutput::error(
+                        "Canvas source was not saved completely; the preview was not updated.",
+                    ));
+                }
+                let (store, key, session_id) = cx
+                    .update(|cx| {
+                        anyhow::Ok((
+                            agent_canvas::CanvasStore::global(cx)
+                                .ok_or_else(|| anyhow::anyhow!("Canvas runtime is unavailable"))?,
+                            crate::canvas::project_key(session.context.project.read(cx), cx),
+                            session
+                                .context
+                                .thread
+                                .read_with(cx, |thread, _| thread.id().to_string())?,
+                        ))
+                    })
+                    .map_err(|error| EditSessionOutput::error(error.to_string()))?;
+                let record = store
+                    .update(cx, |store, cx| {
+                        store.refresh(key, session_id, path.clone(), cx)
+                    })
+                    .await
+                    .map_err(EditSessionOutput::error)?;
+                let check = record
+                    .diagnostics
+                    .clone()
+                    .unwrap_or_else(|| "Canvas TypeScript check: no errors.".into());
+                event_stream.update_fields(acp::ToolCallUpdateFields::new().content(vec![
+                        acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+                            record.title.clone(),
+                            record.uri(),
+                        ))
+                        .into(),
+                        acp::ContentBlock::Text(acp::TextContent::new(check.clone())).into(),
+                    ]));
+                return Ok(EditSessionOutput::Canvas {
+                    canvas_path: path,
+                    title: record.title,
+                    revision: record.revision,
+                    check,
+                });
+            }
             Ok(EditSessionOutput::Success {
                 old_text: session.old_text.clone(),
                 new_text,
@@ -297,7 +391,7 @@ pub(crate) async fn run_session(
         } => {
             session
                 .context
-                .ensure_buffer_saved(&session.buffer, cx)
+                .ensure_buffer_saved(&session.buffer_project, &session.buffer, cx)
                 .await;
             let (_new_text, diff) = session.compute_new_text_and_diff(cx).await;
             if diff.is_empty() {
@@ -352,6 +446,7 @@ pub(crate) struct EditSession {
     abs_path: PathBuf,
     pub(crate) input_path: PathBuf,
     pub(crate) buffer: Entity<Buffer>,
+    buffer_project: Entity<Project>,
     pub(crate) old_text: Arc<String>,
     diff: Entity<Diff>,
     parser: StreamingParser,
@@ -685,7 +780,52 @@ impl EditSession {
         event_stream: &ToolCallEventStream,
         cx: &mut AsyncApp,
     ) -> Result<Self, String> {
-        let target = if let Some(abs_path) =
+        let canvas_path = cx
+            .update(|cx| crate::canvas::resolve_path(context.project.read(cx), &path, cx))
+            .await
+            .map_err(|error| error.to_string())?;
+        let canvas_only = context
+            .thread
+            .read_with(cx, |thread, _| {
+                thread.profile().as_str() == agent_settings::builtin_profiles::ASK
+            })
+            .unwrap_or(false);
+        if canvas_only && canvas_path.is_none() {
+            return Err(
+                "Ask mode can write only Canvas files in the managed Canvas directory.".into(),
+            );
+        }
+        if let Some(canvas_path) = &canvas_path {
+            let fs = context
+                .project
+                .read_with(cx, |project, _| project.fs().clone());
+            if mode == EditSessionMode::Edit
+                && fs
+                    .metadata(canvas_path)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .is_none()
+            {
+                return Err("Canvas file does not exist. Create it with write_file first.".into());
+            }
+        }
+        let buffer_project = if canvas_path.is_some() {
+            cx.update(|cx| {
+                let store = agent_canvas::CanvasStore::global(cx)
+                    .ok_or_else(|| "Canvas runtime is unavailable".to_string())?;
+                Ok::<_, String>(
+                    store.update(cx, |store, cx| store.local_project(&context.project, cx)),
+                )
+            })?
+        } else {
+            context.project.clone()
+        };
+        let target = if let Some(abs_path) = canvas_path {
+            EditSessionTarget {
+                abs_path,
+                project_path: None,
+            }
+        } else if let Some(abs_path) =
             resolve_global_skill_path_for_edit_session(mode, &path, &context, cx).await?
         {
             EditSessionTarget {
@@ -723,13 +863,11 @@ impl EditSession {
             .map_err(|e| e.to_string())?;
 
         let buffer = match project_path {
-            Some(project_path) => context
-                .project
+            Some(project_path) => buffer_project
                 .update(cx, |project, cx| project.open_buffer(project_path, cx))
                 .await
                 .map_err(|e| e.to_string())?,
-            None => context
-                .project
+            None => buffer_project
                 .update(cx, |project, cx| {
                     project.open_local_buffer(abs_path.clone(), cx)
                 })
@@ -737,8 +875,16 @@ impl EditSession {
                 .map_err(|e| e.to_string())?,
         };
 
-        let file_changed_since_last_read =
-            ensure_buffer_saved(&buffer, &abs_path, mode, &context, event_stream, cx).await?;
+        let file_changed_since_last_read = ensure_buffer_saved(
+            &buffer,
+            &buffer_project,
+            &abs_path,
+            mode,
+            &context,
+            event_stream,
+            cx,
+        )
+        .await?;
 
         let diff = cx.new(|cx| Diff::new(buffer.clone(), cx));
         event_stream.update_diff(diff.clone());
@@ -750,6 +896,11 @@ impl EditSession {
             }
         }) as Box<dyn FnOnce()>);
 
+        if buffer_project != context.project {
+            context.action_log.update(cx, |log, cx| {
+                log.set_buffer_project(&buffer, buffer_project.clone(), cx);
+            });
+        }
         context.action_log.update(cx, |log, cx| match mode {
             EditSessionMode::Write => log.buffer_created(buffer.clone(), cx),
             EditSessionMode::Edit => log.buffer_read(buffer.clone(), cx),
@@ -767,6 +918,7 @@ impl EditSession {
             abs_path,
             input_path: path,
             buffer,
+            buffer_project,
             old_text,
             diff,
             parser: StreamingParser::default(),
@@ -1027,6 +1179,7 @@ fn agent_edit_buffer<I, S, T>(
 
 async fn ensure_buffer_saved(
     buffer: &Entity<Buffer>,
+    buffer_project: &Entity<Project>,
     abs_path: &PathBuf,
     mode: EditSessionMode,
     context: &EditSessionContext,
@@ -1043,7 +1196,7 @@ async fn ensure_buffer_saved(
     });
 
     if is_dirty {
-        resolve_dirty_buffer(buffer, mode, context, event_stream, cx).await?;
+        resolve_dirty_buffer(buffer, buffer_project, mode, event_stream, cx).await?;
     }
 
     if let (Some(last_read), Some(current)) = (last_read_mtime, current_mtime)
@@ -1065,8 +1218,8 @@ async fn ensure_buffer_saved(
 /// automatically.
 async fn resolve_dirty_buffer(
     buffer: &Entity<Buffer>,
+    buffer_project: &Entity<Project>,
     mode: EditSessionMode,
-    context: &EditSessionContext,
     event_stream: &ToolCallEventStream,
     cx: &mut AsyncApp,
 ) -> Result<(), String> {
@@ -1127,15 +1280,13 @@ async fn resolve_dirty_buffer(
 
     match decision {
         super::tool_permissions::DirtyBufferDecision::Save => {
-            context
-                .project
+            buffer_project
                 .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
                 .await
                 .map_err(|e| format!("Failed to save buffer: {e}"))?;
         }
         super::tool_permissions::DirtyBufferDecision::Discard => {
-            context
-                .project
+            buffer_project
                 .update(cx, |project, cx| {
                     project.reload_buffers(HashSet::from_iter([buffer.clone()]), false, cx)
                 })

@@ -1881,6 +1881,55 @@ impl MessageEditor {
         });
     }
 
+    pub fn append_canvas_snapshots(
+        &mut self,
+        snapshots: Vec<Arc<[u8]>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Task<()>> {
+        anyhow::ensure!(
+            self.session_capabilities.read().supports_images(),
+            "The selected model does not support images; element details are included in the draft."
+        );
+        let images = snapshots
+            .into_iter()
+            .map(|bytes| {
+                (
+                    gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes.to_vec()),
+                    SharedString::from("Canvas selection"),
+                )
+            })
+            .collect();
+        let editor = self.editor.clone();
+        let mention_set = self.mention_set.clone();
+        let workspace = self.workspace.clone();
+        Ok(window.spawn(cx, async move |cx| {
+            crate::mention_set::insert_images_as_context(
+                images,
+                editor,
+                mention_set,
+                workspace,
+                cx,
+            )
+            .await;
+        }))
+    }
+
+    pub fn append_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            let end = multi_buffer::MultiBufferOffset(editor.text(cx).len());
+            editor.change_selections(
+                editor::SelectionEffects::no_scroll(),
+                window,
+                cx,
+                |selections| {
+                    selections.select_ranges([end..end]);
+                },
+            );
+            editor.insert(text, window, cx);
+        });
+    }
+
     pub fn insert_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         if text.is_empty() {
             return;

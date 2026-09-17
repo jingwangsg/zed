@@ -193,6 +193,7 @@ impl WriteToolTest {
                 .map(|tool| tool.name.clone().into())
                 .collect::<Vec<_>>();
             let template = crate::SystemPromptTemplate {
+                canvas_directory: None,
                 project: &project_context,
                 available_tools: tool_names,
                 model_name: None,

@@ -336,6 +336,67 @@ async fn test_echo(cx: &mut TestAppContext) {
     assert_eq!(stop_events(events), vec![acp::StopReason::EndTurn]);
 }
 
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn test_canvas_capability_reaches_model_only_when_enabled(cx: &mut TestAppContext) {
+    let ThreadTest {
+        thread, model, fs, ..
+    } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+    thread.update(cx, |thread, cx| {
+        thread.add_default_tools(Rc::new(FakeThreadEnvironment::default()), cx)
+    });
+    for (runtime, profile, expected) in [
+        (false, "write", false),
+        (true, "write", true),
+        (true, "ask", true),
+        (true, "minimal", false),
+    ] {
+        if runtime {
+            cx.update(|cx| {
+                agent_canvas::CanvasStore::init(
+                    node_runtime::NodeRuntime::unavailable(),
+                    fs.clone(),
+                    cx,
+                )
+            });
+        }
+        let events = thread
+            .update(cx, |thread, cx| {
+                thread.set_profile(AgentProfileId(profile.into()), cx);
+                thread.send(ClientUserMessageId::new(), ["Prepare a report"], cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let request = fake_model
+            .pending_completions()
+            .pop()
+            .expect("model request");
+        assert!(
+            !tool_names_for_completion(&request)
+                .iter()
+                .any(|name| name == "canvas")
+        );
+        if expected {
+            assert!(
+                tool_names_for_completion(&request)
+                    .iter()
+                    .any(|name| name == "write_file")
+            );
+        }
+        let MessageContent::Text(prompt) = &request.messages[0].content[0] else {
+            panic!("Missing system prompt");
+        };
+        assert_eq!(prompt.contains("## Canvas"), expected, "{profile}");
+        fake_model.send_last_completion_stream_text_chunk("Done");
+        fake_model.send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(
+            StopReason::EndTurn,
+        ));
+        fake_model.end_last_completion_stream();
+        let _: Vec<_> = events.collect().await;
+    }
+}
+
 #[gpui::test]
 async fn test_terminal_tool_timeout_kills_handle(cx: &mut TestAppContext) {
     init_test(cx);

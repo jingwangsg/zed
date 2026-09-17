@@ -54,6 +54,8 @@ pub struct ActionLog {
     tracked_buffers: BTreeMap<Entity<Buffer>, TrackedBuffer>,
     /// The project this action log is associated with
     project: Entity<Project>,
+    // Reject can remove a tracked buffer before undo needs to save it again.
+    buffer_projects: HashMap<gpui::EntityId, Entity<Project>>,
     /// An action log to forward all public methods to
     /// Useful in cases like subagents, where we want to track individual diffs for this subagent,
     /// but also want to associate the reads/writes with a parent review experience
@@ -70,6 +72,7 @@ impl ActionLog {
         Self {
             tracked_buffers: BTreeMap::default(),
             project,
+            buffer_projects: HashMap::default(),
             linked_action_log: None,
             last_reject_undo: None,
             file_read_times: HashMap::default(),
@@ -83,6 +86,26 @@ impl ActionLog {
 
     pub fn project(&self) -> &Entity<Project> {
         &self.project
+    }
+
+    pub fn set_buffer_project(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        project: Entity<Project>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(linked_action_log) = &self.linked_action_log {
+            linked_action_log.update(cx, |log, cx| {
+                log.set_buffer_project(buffer, project.clone(), cx);
+            });
+        }
+        self.buffer_projects.insert(buffer.entity_id(), project);
+    }
+
+    fn project_for_buffer(&self, buffer: &Entity<Buffer>) -> &Entity<Project> {
+        self.buffer_projects
+            .get(&buffer.entity_id())
+            .unwrap_or(&self.project)
     }
 
     pub fn file_read_time(&self, path: &Path) -> Option<MTime> {
@@ -148,11 +171,12 @@ impl ActionLog {
             TrackedBufferStatus::Modified
         };
 
+        let project = self.project_for_buffer(&buffer).clone();
         let tracked_buffer = self
             .tracked_buffers
             .entry(buffer.clone())
             .or_insert_with(|| {
-                let open_lsp_handle = self.project.update(cx, |project, cx| {
+                let open_lsp_handle = project.update(cx, |project, cx| {
                     project.register_buffer_with_language_servers(&buffer, cx)
                 });
 
@@ -287,7 +311,7 @@ impl ActionLog {
     ) -> Result<()> {
         let git_diff = this
             .update(cx, |this, cx| {
-                this.project.update(cx, |project, cx| {
+                this.project_for_buffer(&buffer).update(cx, |project, cx| {
                     project.open_uncommitted_diff(buffer.clone(), cx)
                 })
             })?
@@ -716,6 +740,7 @@ impl ActionLog {
         telemetry: Option<ActionLogTelemetry>,
         cx: &mut Context<Self>,
     ) -> (Task<Result<()>>, Option<PerBufferUndo>) {
+        let project = self.project_for_buffer(&buffer).clone();
         let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) else {
             return (Task::ready(Ok(())), None);
         };
@@ -751,8 +776,7 @@ impl ActionLog {
                         },
                     });
 
-                    self.project
-                        .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
+                    project.update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
                 } else {
                     // For a file created by AI with no pre-existing content,
                     // only delete the file if we're certain it contains only AI content
@@ -772,8 +796,7 @@ impl ActionLog {
                             .read(cx)
                             .entry_id(cx)
                             .and_then(|entry_id| {
-                                self.project
-                                    .update(cx, |project, cx| project.delete_entry(entry_id, cx))
+                                project.update(cx, |project, cx| project.delete_entry(entry_id, cx))
                             })
                             .unwrap_or_else(|| Task::ready(Ok(())));
 
@@ -801,9 +824,8 @@ impl ActionLog {
                 buffer.update(cx, |buffer, cx| {
                     buffer.set_text(tracked_buffer.diff_base.to_string(), cx)
                 });
-                let save = self
-                    .project
-                    .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx));
+                let save =
+                    project.update(cx, |project, cx| project.save_buffer(buffer.clone(), cx));
 
                 // Clear all tracked edits for this buffer and start over as if we just read it.
                 metrics.add_edits(tracked_buffer.unreviewed_edits.edits());
@@ -883,8 +905,7 @@ impl ActionLog {
                     });
                 }
 
-                self.project
-                    .update(cx, |project, cx| project.save_buffer(buffer, cx))
+                project.update(cx, |project, cx| project.save_buffer(buffer, cx))
             }
         };
         if let Some(telemetry) = telemetry {
@@ -1010,7 +1031,7 @@ impl ActionLog {
             }
 
             let save = self
-                .project
+                .project_for_buffer(&buffer)
                 .update(cx, |project, cx| project.save_buffer(buffer, cx));
             save_tasks.push(save);
         }

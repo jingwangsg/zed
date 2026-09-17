@@ -1,0 +1,37 @@
+[package]
+name = "gpui_webview"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lib]
+path = "src/gpui_webview.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+gpui.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+log.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-app-kit = { workspace = true, features = ["objc2-quartz-core", "NSImage", "NSImageRep", "NSBitmapImageRep"] }
+objc2-foundation.workspace = true
+objc2-web-kit.workspace = true
+objc2-quartz-core.workspace = true
+objc2-core-graphics.workspace = true
+block2.workspace = true
+raw-window-handle.workspace = true
+
+[dev-dependencies]
+gpui_platform = { workspace = true, features = ["font-kit"] }
+env_logger.workspace = true
+
+[[example]]
+name = "embedded"
+path = "examples/embedded.rs"

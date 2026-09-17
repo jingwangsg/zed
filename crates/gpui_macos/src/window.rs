@@ -2532,6 +2532,18 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
 }
 
 extern "C" fn handle_key_equivalent(this: &Object, _: Sel, native_event: id) -> BOOL {
+    unsafe {
+        let window: id = msg_send![this, window];
+        let responder: id = msg_send![window, firstResponder];
+        let is_view: BOOL = msg_send![responder, isKindOfClass: class!(NSView)];
+        if responder != this as *const Object as id && is_view == YES {
+            let is_child: BOOL = msg_send![responder, isDescendantOf: this];
+            if is_child == YES {
+                // Native children own text input and editing shortcuts while they have focus.
+                return msg_send![super(this, class!(NSView)), performKeyEquivalent: native_event];
+            }
+        }
+    }
     handle_key_event(this, native_event, true)
 }
 
@@ -2749,6 +2761,13 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
 }
 
 extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
+    if unsafe { native_event.eventType() } == NSEventType::NSLeftMouseDown {
+        unsafe {
+            let window: id = msg_send![this, window];
+            // AppKit does not restore the GPUI responder after clicking outside a native child.
+            window.makeFirstResponder_(this as *const Object as id);
+        }
+    }
     let window_state = unsafe { get_window_state(this) };
     let weak_window_state = Arc::downgrade(&window_state);
     let mut lock = window_state.as_ref().lock();

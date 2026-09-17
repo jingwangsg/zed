@@ -5,6 +5,8 @@ mod agent_model_selector;
 mod agent_panel;
 mod agent_registry_ui;
 mod buffer_codegen;
+#[cfg(target_os = "macos")]
+mod canvas;
 mod completion_provider;
 mod config_options;
 mod context;
@@ -613,6 +615,8 @@ pub fn init(
         // we're not running inside of the eval.
         init_language_model_settings(cx);
     }
+    #[cfg(target_os = "macos")]
+    canvas::init(cx);
     agent_panel::init(cx);
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
