@@ -11,7 +11,7 @@ Zed opens a worktree each time you run `zed some/path`, drag a file or directory
 > Note: This is broader than a [Git worktree](./git.md#git-worktrees). A Git worktree is a linked checkout managed by Git; Zed's trust model applies to every opened file or folder root, including Git worktrees.
 
 Every worktree opened may contain a `.zed/settings.json` file with extra configuration options that may require installing and spawning language servers or MCP servers.
-To let users choose based on their own threat model and risk tolerance, all worktrees start in Restricted Mode. Restricted Mode prevents downloading and running related items from `.zed/settings.json`. Until a worktree is trusted, Zed does not run related untrusted actions and waits for user confirmation. This gives users a chance to review project settings, MCP servers, and language servers.
+By default, Zed trusts every worktree it opens. Disable the `session.trust_all_worktrees` setting to start worktrees in Restricted Mode instead and choose based on your own threat model and risk tolerance. Restricted Mode prevents downloading and running related items from `.zed/settings.json`. Until a worktree is trusted, Zed does not run related untrusted actions and waits for user confirmation. This gives users a chance to review project settings, MCP servers, and language servers.
 
 Zed still trusts tools it installs globally. Global MCP servers and global language servers such as Prettier and Copilot are installed and started as usual, independent of worktree trust.
 
@@ -32,11 +32,11 @@ Restricted Mode prevents:
 
 ## Configuring broad worktree trust
 
-By default, Zed does not trust new worktrees. Users must trust each new worktree individually. Though not recommended, users can trust all worktrees with this setting ([how to edit](./configuring-zed.md#settings-files)):
+By default, Zed trusts all worktrees. To have Zed ask before trusting each new worktree, disable this setting ([how to edit](./configuring-zed.md#settings-files)):
 
 ```json [settings]
 "session": {
-  "trust_all_worktrees": true
+  "trust_all_worktrees": false
 }
 ```
 

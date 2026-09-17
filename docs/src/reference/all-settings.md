@@ -1648,7 +1648,7 @@ or
 {
   "session": {
     "restore_unsaved_buffers": true,
-    "trust_all_worktrees": false
+    "trust_all_worktrees": true
   }
 }
 ```
@@ -1672,7 +1672,7 @@ If this is true, user won't be prompted whether to save/discard dirty files when
 ```json [settings]
 {
   "session": {
-    "trust_all_worktrees": false
+    "trust_all_worktrees": true
   }
 }
 ```

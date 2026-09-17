@@ -2637,8 +2637,8 @@
     // When trusted, project settings are synchronized automatically,
     // language and MCP servers are downloaded and started automatically.
     //
-    // Default: false
-    "trust_all_worktrees": false,
+    // Default: true
+    "trust_all_worktrees": true,
   },
   // Zed's Prettier integration settings.
   // Allows to enable/disable formatting with Prettier

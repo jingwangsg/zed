@@ -418,7 +418,7 @@ pub struct SessionSettingsContent {
     /// When trusted, project settings are synchronized automatically,
     /// language and MCP servers are downloaded and started automatically.
     ///
-    /// Default: false
+    /// Default: true
     pub trust_all_worktrees: Option<bool>,
 }
 
