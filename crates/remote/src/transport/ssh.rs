@@ -639,6 +639,7 @@ impl SshRemoteConnection {
         use askpass::AskPassResult;
 
         let destination = connection_options.ssh_destination();
+        let connect_started = Instant::now();
 
         let temp_dir = tempfile::Builder::new()
             .prefix("zed-ssh-session")
@@ -788,6 +789,8 @@ impl SshRemoteConnection {
             (socket, Some(master_process))
         };
 
+        let master_ready = connect_started.elapsed();
+
         let is_windows = socket.probe_is_windows().await;
         log::info!("Remote is windows: {}", is_windows);
 
@@ -800,6 +803,7 @@ impl SshRemoteConnection {
 
         let ssh_os_version = socket.os_version(ssh_platform.os, ssh_shell_kind).await;
         log::info!("Remote OS version discovered: {:?}", ssh_os_version);
+        let probes_done = connect_started.elapsed();
 
         let (ssh_path_style, ssh_default_system_shell) = match ssh_platform.os {
             RemoteOs::Windows => (PathStyle::Windows, ssh_shell.clone()),
@@ -825,6 +829,14 @@ impl SshRemoteConnection {
         this.remote_binary_path = Some(
             this.ensure_server_binary(&delegate, release_channel, version, cx)
                 .await?,
+        );
+        let server_binary_ready = connect_started.elapsed();
+        log::info!(
+            "ssh {destination} ready in {:.2?}: master {:.2?}, probes {:.2?}, server binary {:.2?}",
+            server_binary_ready,
+            master_ready,
+            probes_done.saturating_sub(master_ready),
+            server_binary_ready.saturating_sub(probes_done),
         );
 
         Ok(this)

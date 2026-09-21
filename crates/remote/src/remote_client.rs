@@ -447,6 +447,7 @@ impl RemoteClient {
                     state: Some(State::Connecting),
                 });
 
+                let proxy_started = Instant::now();
                 let io_task = remote_connection.start_proxy(
                     unique_identifier,
                     false,
@@ -500,6 +501,7 @@ impl RemoteClient {
                     log::error!("failed to establish connection: {}", error);
                     return Err(error);
                 }
+                log::info!("remote server ready in {:.2?}", proxy_started.elapsed());
 
                 let heartbeat_task = Self::heartbeat(this.downgrade(), connection_activity_rx, cx);
 
@@ -682,6 +684,7 @@ impl RemoteClient {
                     .timer(RECONNECT_RETRY_DELAY * (attempts - 1) as u32)
                     .await;
             }
+            let attempt_started = Instant::now();
 
             let connection_options = remote_connection.connection_options();
 
@@ -722,6 +725,10 @@ impl RemoteClient {
             if let Err(error) = client.resync(HEARTBEAT_TIMEOUT).await {
                 failed!(error, attempts, remote_connection, delegate);
             };
+            log::info!(
+                "reconnect attempt {attempts} succeeded in {:.2?}",
+                attempt_started.elapsed()
+            );
 
             State::Connected {
                 remote_connection,
