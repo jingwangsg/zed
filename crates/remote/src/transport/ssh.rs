@@ -791,17 +791,28 @@ impl SshRemoteConnection {
 
         let master_ready = connect_started.elapsed();
 
-        let is_windows = socket.probe_is_windows().await;
-        log::info!("Remote is windows: {}", is_windows);
-
-        let ssh_shell = socket.shell(is_windows).await;
-        log::info!("Remote shell discovered: {}", ssh_shell);
-
+        // One round-trip covers Linux and macOS; the separate probes remain for
+        // Windows hosts and for hosts whose `sh` or `uname` the combined probe
+        // cannot handle.
+        let (is_windows, ssh_shell, ssh_platform, ssh_os_version) = match socket.probe_posix().await
+        {
+            Ok((ssh_shell, ssh_platform, ssh_os_version)) => {
+                (false, ssh_shell, ssh_platform, ssh_os_version)
+            }
+            Err(error) => {
+                log::info!("combined POSIX probe failed, probing separately: {error:#}");
+                let is_windows = socket.probe_is_windows().await;
+                let ssh_shell = socket.shell(is_windows).await;
+                let ssh_shell_kind = ShellKind::new(&ssh_shell, is_windows);
+                let ssh_platform = socket.platform(ssh_shell_kind, is_windows).await?;
+                let ssh_os_version = socket.os_version(ssh_platform.os, ssh_shell_kind).await;
+                (is_windows, ssh_shell, ssh_platform, ssh_os_version)
+            }
+        };
         let ssh_shell_kind = ShellKind::new(&ssh_shell, is_windows);
-        let ssh_platform = socket.platform(ssh_shell_kind, is_windows).await?;
+        log::info!("Remote is windows: {}", is_windows);
+        log::info!("Remote shell discovered: {}", ssh_shell);
         log::info!("Remote platform discovered: {:?}", ssh_platform);
-
-        let ssh_os_version = socket.os_version(ssh_platform.os, ssh_shell_kind).await;
         log::info!("Remote OS version discovered: {:?}", ssh_os_version);
         let probes_done = connect_started.elapsed();
 
@@ -1466,6 +1477,20 @@ impl SshSocket {
             args
         };
         arguments
+    }
+
+    async fn probe_posix(&self) -> Result<(String, RemotePlatform, Option<String>)> {
+        // `|| true` keeps a host without `/etc/os-release` or `sw_vers` from
+        // failing the whole command; the OS version is telemetry only.
+        let script = format!(
+            "echo $SHELL; echo {separator}; uname -sm; echo {separator}; \
+             cat /etc/os-release 2>/dev/null || sw_vers -productVersion 2>/dev/null || true",
+            separator = super::POSIX_PROBE_SEPARATOR
+        );
+        let output = self
+            .run_command(ShellKind::Posix, "sh", &["-c", &script], false)
+            .await?;
+        super::parse_posix_probe(&output)
     }
 
     async fn platform(&self, shell: ShellKind, is_windows: bool) -> Result<RemotePlatform> {

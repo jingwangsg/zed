@@ -460,6 +460,28 @@ async fn which(
     }
 }
 
+/// Separates the `$SHELL`, `uname -sm` and OS version sections of the combined
+/// POSIX probe run by `SshSocket::probe_posix`.
+pub(crate) const POSIX_PROBE_SEPARATOR: &str = "__ZED_PROBE__";
+
+/// Parses the output of the combined POSIX probe into the shell, platform and
+/// OS version. Fails when `uname` does not name a supported platform (for
+/// example Git Bash on Windows) so the caller can fall back to separate probes.
+pub(crate) fn parse_posix_probe(output: &str) -> Result<(String, RemotePlatform, Option<String>)> {
+    let mut sections = output.split(POSIX_PROBE_SEPARATOR);
+    let (Some(shell), Some(uname), Some(os_version)) =
+        (sections.next(), sections.next(), sections.next())
+    else {
+        anyhow::bail!("unexpected probe output: {output:?}");
+    };
+    let platform = parse_platform(uname)?;
+    Ok((
+        parse_shell(shell, "sh"),
+        platform,
+        parse_os_version(platform.os, os_version),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,5 +590,49 @@ mod tests {
         );
         assert_eq!(parse_shell("", "sh"), "sh");
         assert_eq!(parse_shell("\n", "sh"), "sh");
+    }
+
+    #[test]
+    fn test_parse_posix_probe() {
+        let (shell, platform, os_version) = parse_posix_probe(
+            "/bin/bash\n__ZED_PROBE__\nLinux aarch64\n__ZED_PROBE__\n\
+             ID=ubuntu\nVERSION_ID=\"24.04\"\n",
+        )
+        .unwrap();
+        assert_eq!(shell, "/bin/bash");
+        assert_eq!(platform.os, RemoteOs::Linux);
+        assert_eq!(platform.arch, RemoteArch::Aarch64);
+        assert_eq!(os_version, Some("ubuntu 24.04".to_string()));
+
+        // Shell initialization output lands in the first section only.
+        let (shell, platform, os_version) = parse_posix_probe(
+            "Last login: Mon Sep 22\n/bin/zsh\n__ZED_PROBE__\nDarwin arm64\n__ZED_PROBE__\n\
+             15.6.1\n",
+        )
+        .unwrap();
+        assert_eq!(shell, "/bin/zsh");
+        assert_eq!(platform.os, RemoteOs::MacOs);
+        assert_eq!(platform.arch, RemoteArch::Aarch64);
+        assert_eq!(os_version, Some("15.6.1".to_string()));
+
+        let (shell, platform, os_version) =
+            parse_posix_probe("\n__ZED_PROBE__\nLinux x86_64\n__ZED_PROBE__\n").unwrap();
+        assert_eq!(shell, "sh");
+        assert_eq!(platform.os, RemoteOs::Linux);
+        assert_eq!(os_version, None);
+
+        // Git Bash on Windows answers the probe with an unsupported `uname`.
+        assert!(
+            parse_posix_probe(
+                "/usr/bin/bash\n__ZED_PROBE__\nMINGW64_NT-10.0 x86_64\n__ZED_PROBE__\n"
+            )
+            .is_err()
+        );
+        assert!(parse_posix_probe("sh: command not found\n").is_err());
+        // Missing `uname`: the script still exits zero because of `|| true`, so the
+        // empty section is what has to trigger the fallback.
+        assert!(
+            parse_posix_probe("/bin/bash\n__ZED_PROBE__\n\n__ZED_PROBE__\nID=ubuntu\n").is_err()
+        );
     }
 }
