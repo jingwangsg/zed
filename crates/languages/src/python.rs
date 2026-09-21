@@ -417,12 +417,24 @@ impl LspAdapter for TyLspAdapter {
         _: Option<Uri>,
         cx: &mut AsyncApp,
     ) -> Result<Value> {
-        let mut ret = cx
-            .update(|cx| {
-                language_server_settings(delegate.as_ref(), &self.name(), cx)
+        let (mut ret, diagnostic_mode_in_initialization_options) = cx.update(|cx| {
+            let settings = language_server_settings(delegate.as_ref(), &self.name(), cx);
+            (
+                settings
                     .and_then(|s| s.settings.clone())
-            })
-            .unwrap_or_else(|| json!({}));
+                    .unwrap_or_else(|| json!({})),
+                settings
+                    .and_then(|s| s.initialization_options.as_ref())
+                    .is_some_and(|options| options.get("diagnosticMode").is_some()),
+            )
+        });
+        // ty's own default is `openFilesOnly`. Its type checker is still pre-1.0, so we keep ty as
+        // a navigation-and-completion server unless the user opts into diagnostics. ty lets a
+        // non-default workspace-configuration value override initialization options, so skip the
+        // default when the user set `diagnosticMode` there.
+        if !diagnostic_mode_in_initialization_options && let Some(object) = ret.as_object_mut() {
+            object.entry("diagnosticMode").or_insert(json!("off"));
+        }
         if let Some(toolchain) = toolchain.and_then(|toolchain| {
             serde_json::from_value::<PythonToolchainData>(toolchain.as_json).ok()
         }) {

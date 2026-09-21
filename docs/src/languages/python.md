@@ -76,7 +76,7 @@ Zed provides several Python language servers out of the box. By default, [basedp
 
 Other built-in language servers are:
 
-- [ty](https://docs.astral.sh/ty/)&mdash;Up-and-coming language server from Astral, built for speed.
+- [ty](https://docs.astral.sh/ty/)&mdash;Up-and-coming language server from Astral, built for speed. Zed sets `diagnosticMode` to `off` by default, so ty provides navigation and completions but no type-checking diagnostics. To enable them, set `diagnosticMode` to `openFilesOnly` or `workspace` under `lsp.ty.settings`.
 - [Pyright](https://github.com/microsoft/pyright)&mdash;The basis for basedpyright.
 - [PyLSP](https://github.com/python-lsp/python-lsp-server)&mdash;A plugin-based language server that integrates with tools like `pycodestyle`, `autopep8`, and `yapf`.
 
