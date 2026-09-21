@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+#
+# Build the local stable-channel macOS app and an installer package for this fork.
+#
+# Compared to script/bundle-mac this script:
+# - cross-builds remote_server for Linux aarch64 with cargo-zigbuild and embeds it as
+#   Contents/MacOS/zed-remote-server-linux-aarch64.gz, which `auto_update::bundled_remote_server_path`
+#   uploads to SSH hosts instead of downloading an official server that does not exist for local builds;
+# - builds without `--target` so the existing target/release cache is reused;
+# - signs ad hoc and produces an unsigned productbuild .pkg instead of a notarized DMG.
+#
+# Output: target/release/bundle/osx/Zed.app and target/release/Zed-<version>-build<build>.pkg
+#
+# After installing a rebuilt package, delete the previously uploaded server on each SSH host
+# (`rm ~/.zed_server/zed-remote-server-stable-<version>`); the version string does not change
+# between local builds, so Zed keeps the old binary otherwise.
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+remote_triple=aarch64-unknown-linux-musl
+remote_archive=zed-remote-server-linux-aarch64.gz
+build_tools=/private/tmp/zed-remote-build-tools
+package_identifier=dev.zed.Zed.local.subscriptions
+GIT_VERSION="v2.43.3"
+GIT_VERSION_SHA="fa29823"
+
+export ZED_RELEASE_CHANNEL=stable
+export ZED_BUNDLE=true
+# script/bundle-mac exports CXXFLAGS=-stdlib=libc++; the release cache was built without it and
+# setting it reruns every cc-based build script, so leave it unset.
+unset CXXFLAGS
+
+echo "Checking tools"
+command -v uv >/dev/null || { echo "uv is required (brew install uv)"; exit 1; }
+cargo_bundle_version=$(cargo -q bundle --help 2>&1 | head -n 1 || echo "")
+if [ "$cargo_bundle_version" != "cargo-bundle v0.6.1-zed" ]; then
+    cargo install cargo-bundle --git https://github.com/zed-industries/cargo-bundle.git --branch zed-deploy
+fi
+rustup target add "$remote_triple"
+llvm_objcopy="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-objcopy"
+if [ ! -x "$llvm_objcopy" ]; then
+    rustup component add llvm-tools
+fi
+if [ ! -x "$build_tools/bin/cargo-zigbuild" ]; then
+    uv venv --python 3.12 "$build_tools"
+    uv pip install --python "$build_tools/bin/python3" 'ziglang==0.16.0' 'cargo-zigbuild==0.23.4'
+fi
+
+echo "Compiling remote_server for $remote_triple"
+# RUSTFLAGS replaces the [build] rustflags from .cargo/config.toml, so they are repeated here.
+PATH="$build_tools/bin:$PATH" \
+RUSTFLAGS="--cfg tokio_unstable -C symbol-mangling-version=v0 -C target-feature=+crt-static" \
+    cargo zigbuild --release --package remote_server --target "$remote_triple" --target-dir target/remote_server
+remote_binary="target/remote_server/$remote_triple/release/remote_server"
+# Same strip flags as script/bundle-linux; zig objcopy rejects this binary with "unimplemented".
+"$llvm_objcopy" --strip-debug --discard-all "$remote_binary" "$remote_binary.stripped"
+gzip -f --stdout --best "$remote_binary.stripped" > "target/$remote_archive"
+
+echo "Compiling zed binaries"
+if ! script/generate-licenses; then
+    echo "script/generate-licenses failed; keeping the existing assets/licenses.md"
+    test -s assets/licenses.md
+fi
+cargo --config .cargo/bundle-config.toml build --release --package zed --package cli
+
+echo "Creating application bundle"
+pushd crates/zed
+cp Cargo.toml Cargo.toml.backup
+trap "mv -f '$PWD/Cargo.toml.backup' '$PWD/Cargo.toml' 2>/dev/null || true" EXIT
+sed -i.backup "s/package.metadata.bundle-stable/package.metadata.bundle/" Cargo.toml
+app_path=$(CARGO_BUNDLE_SKIP_BUILD=true cargo bundle --release --select-workspace-root | xargs)
+mv Cargo.toml.backup Cargo.toml
+trap - EXIT
+popd
+echo "Bundled ${app_path}"
+
+resources="${app_path}/Contents/Resources"
+cp crates/zed/resources/Document.icns "${resources}/Document.icns"
+cp LICENSE-APACHE LICENSE-GPL assets/licenses.md "${resources}/"
+curl --silent --fail --location "https://raw.githubusercontent.com/git/git/${GIT_VERSION}/COPYING" -o "${resources}/git-COPYING"
+cp crates/agent_canvas/README.md "${resources}/Canvas.md"
+canvas_runtime=crates/agent_canvas/runtime
+canvas_licenses="${resources}/CanvasLicenses"
+rm -rf "${canvas_licenses}"
+pushd "${canvas_runtime}/dist"
+find . -type f \( -iname 'LICENSE*' -o -iname 'LICENCE*' -o -iname '*.LEGAL.txt' \) -exec ditto {} "${canvas_licenses}/{}" \;
+popd
+if [ -d "${canvas_runtime}/node_modules" ]; then
+    pushd "${canvas_runtime}/node_modules"
+    find . -type f \( -iname 'LICENSE*' -o -iname 'LICENCE*' -o -iname 'NOTICE*' \) -not -path './playwright*' \
+        -exec ditto {} "${canvas_licenses}/npm/{}" \;
+    popd
+    python3 - "${canvas_runtime}/node_modules" "${canvas_licenses}/npm/packages.json" <<'EOF'
+import glob, json, os, sys
+node_modules, output = sys.argv[1], sys.argv[2]
+packages = []
+for manifest in sorted(glob.glob(f"{node_modules}/*/package.json") + glob.glob(f"{node_modules}/@*/*/package.json")):
+    data = json.load(open(manifest))
+    if data.get("name", "").startswith("playwright"):
+        continue
+    packages.append({"name": data.get("name"), "version": data.get("version"), "license": data.get("license")})
+json.dump(packages, open(output, "w"), indent=2)
+EOF
+fi
+
+rm -rf "${app_path}/Contents/Frameworks"
+mkdir -p "${app_path}/Contents/Frameworks"
+cp target/release/zed "${app_path}/Contents/MacOS/zed"
+cp target/release/cli "${app_path}/Contents/MacOS/cli"
+strip -x "${app_path}/Contents/MacOS/zed"
+strip -x "${app_path}/Contents/MacOS/cli"
+
+echo "Downloading git binary"
+git_tmp=$(mktemp -d)
+curl --silent --fail --location \
+    "https://github.com/desktop/dugite-native/releases/download/${GIT_VERSION}/dugite-native-${GIT_VERSION}-${GIT_VERSION_SHA}-macOS-arm64.tar.gz" \
+    | tar -xz -C "$git_tmp" -f - bin/git
+mv "$git_tmp/bin/git" "${app_path}/Contents/MacOS/git"
+rm -rf "$git_tmp"
+
+cp crates/zed/contents/stable/embedded.provisionprofile "${app_path}/Contents/"
+cp "target/$remote_archive" "${app_path}/Contents/MacOS/$remote_archive"
+
+echo "Signing application bundle"
+sed '/com.apple.developer.associated-domains/,+1d' crates/zed/resources/zed.entitlements > "${resources}/zed.entitlements"
+codesign --force --deep --entitlements "${resources}/zed.entitlements" --sign - "${app_path}"
+codesign --verify --deep --strict "${app_path}"
+
+echo "Creating installer package"
+version=$(defaults read "${app_path}/Contents/Info.plist" CFBundleShortVersionString)
+build=$(defaults read "${app_path}/Contents/Info.plist" CFBundleVersion)
+package_dir=target/release/pkg
+package_path="target/release/Zed-${version}-build${build}.pkg"
+rm -rf "$package_dir"
+mkdir -p "$package_dir/root/Applications"
+ditto "${app_path}" "$package_dir/root/Applications/Zed.app"
+cat > "$package_dir/component.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+    <dict>
+        <key>BundleHasStrictIdentifier</key>
+        <true/>
+        <key>BundleIsRelocatable</key>
+        <false/>
+        <key>BundleIsVersionChecked</key>
+        <false/>
+        <key>BundleOverwriteAction</key>
+        <string>upgrade</string>
+        <key>RootRelativeBundlePath</key>
+        <string>Applications/Zed.app</string>
+    </dict>
+</array>
+</plist>
+PLIST
+pkgbuild --root "$package_dir/root" --component-plist "$package_dir/component.plist" \
+    --identifier "$package_identifier" --version "$version" --install-location / \
+    "$package_dir/ZedComponent.pkg"
+cat > "$package_dir/Distribution.xml" <<XML
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Zed ${version}</title>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <choices-outline>
+        <line choice="default"/>
+    </choices-outline>
+    <choice id="default" visible="false">
+        <pkg-ref id="${package_identifier}"/>
+    </choice>
+    <pkg-ref id="${package_identifier}" version="${version}" onConclusion="none">#ZedComponent.pkg</pkg-ref>
+</installer-gui-script>
+XML
+productbuild --distribution "$package_dir/Distribution.xml" --package-path "$package_dir" "$package_path"
+
+echo "Verifying installer package"
+installer -pkginfo -pkg "$package_path"
+echo "payload files: $(pkgutil --payload-files "$package_path" | wc -l | tr -d ' '), bundle files: $(find "${app_path}" | wc -l | tr -d ' ')"
+shasum -a 256 "target/$remote_archive" "$package_path"
+echo "Created ${package_path}"
