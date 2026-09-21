@@ -161,10 +161,11 @@ const MAX_MISSED_HEARTBEATS: usize = 5;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECT_RETRY_DELAY: Duration = Duration::from_secs(10);
+const MAX_RECONNECT_RETRY_DELAY: Duration = Duration::from_secs(20);
 const INITIAL_CONNECTION_TIMEOUT: Duration =
     Duration::from_secs(if cfg!(debug_assertions) { 5 } else { 60 });
 
-pub const MAX_RECONNECT_ATTEMPTS: usize = 3;
+pub const MAX_RECONNECT_ATTEMPTS: usize = 10;
 
 enum State {
     Connecting,
@@ -679,9 +680,12 @@ impl RemoteClient {
             };
 
             if attempts > 1 {
-                // SSH proxies may still be restarting after the first connection failure.
+                // A dropped SSH tunnel takes tens of seconds to come back (25 to 55 s
+                // measured for a SkyPilot port-forward), so wait longer after each
+                // failure, capped so the later attempts stay 20 s apart.
+                let delay = RECONNECT_RETRY_DELAY * (attempts - 1) as u32;
                 cx.background_executor()
-                    .timer(RECONNECT_RETRY_DELAY * (attempts - 1) as u32)
+                    .timer(delay.min(MAX_RECONNECT_RETRY_DELAY))
                     .await;
             }
             let attempt_started = Instant::now();
@@ -1472,7 +1476,9 @@ mod tests {
         });
         drop(guard);
         let client = RemoteClient::connect_mock(options, cx).await;
-        for (failed_attempts, delay_seconds) in [(1, 10), (2, 20)] {
+        for (failed_attempts, delay_seconds) in
+            [(1, 10), (2, 20), (3, 20), (MAX_RECONNECT_ATTEMPTS - 1, 20)]
+        {
             client.update(cx, |client, cx| {
                 client.force_heartbeat_timeout(failed_attempts, cx)
             });
@@ -1500,6 +1506,15 @@ mod tests {
                 .await
                 .unwrap();
         }
+
+        client.update(cx, |client, cx| {
+            client.force_heartbeat_timeout(MAX_RECONNECT_ATTEMPTS, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            client.read_with(cx, |client, _| client.connection_state()),
+            ConnectionState::Disconnected
+        );
     }
 
     #[gpui::test]
