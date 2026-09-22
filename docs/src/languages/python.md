@@ -108,6 +108,8 @@ See: [Working with Language Servers](https://zed.dev/docs/configuring-languages#
 
 Note that while basedpyright in isolation defaults to the `recommended` [type-checking mode](https://docs.basedpyright.com/latest/benefits-over-pyright/better-defaults/#typecheckingmode), Zed configures it to use the less-strict `standard` mode by default, which matches the behavior of Pyright. You can set the type-checking mode for your project using the `typeCheckingMode` setting in `pyrightconfig.json` or `pyproject.toml`, which will override Zed's default. Read on for more details about how to configure basedpyright.
 
+This fork also sets the `reportAttributeAccessIssue` rule to `none` unless you set it yourself under `lsp.basedpyright.settings.basedpyright.analysis.diagnosticSeverityOverrides`; other overrides you configure there are kept.
+
 #### Basedpyright Configuration
 
 basedpyright reads configuration options from two different kinds of sources:
@@ -203,6 +205,8 @@ For most projects, Zed will automatically select the right Python toolchain. In 
 
 Zed uses [Ruff](https://github.com/astral-sh/ruff) for formatting and linting Python code. Specifically, it runs Ruff as an LSP server using the `ruff server` subcommand.
 
+In this fork Ruff's lint diagnostics are off by default; formatting and import sorting still work. To turn the diagnostics on, set `lsp.ruff.initialization_options.settings.lint.enable` to `true` (example below).
+
 ### Configuring Formatting
 
 Formatting in Zed follows a two-phase pipeline: first, code actions on format (`code_actions_on_format`) are executed, followed by the configured formatter.
@@ -270,7 +274,7 @@ Configure in Settings ({#kb zed::OpenSettings}) under Languages > Python, or add
 
 Like basedpyright, Ruff reads options from both Zed's language server settings and configuration files (`ruff.toml`) when used in Zed. Unlike basedpyright, _all_ options can be configured in either of these locations, so the choice of where to put your Ruff configuration comes down to whether you want it to be shared between projects but specific to Zed (in which case you should use language server settings), or specific to one project but common to all Ruff invocations (in which case you should use `ruff.toml`).
 
-Here's an example of using language server settings in Zed's `settings.json` to disable all Ruff lints in Zed (while still using Ruff as a formatter):
+Here's an example of using language server settings in Zed's `settings.json` to enable Ruff's lint diagnostics, which this fork turns off by default:
 
 ```json [settings]
 {
@@ -278,7 +282,9 @@ Here's an example of using language server settings in Zed's `settings.json` to 
     "ruff": {
       "initialization_options": {
         "settings": {
-          "exclude": ["*"]
+          "lint": {
+            "enable": true
+          }
         }
       }
     }

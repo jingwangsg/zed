@@ -2203,6 +2203,29 @@ impl LspAdapter for BasedPyrightLspAdapter {
             }
 
             normalize_pyright_analysis_configuration(&mut user_settings, "basedpyright");
+            // Config objects are often typed as `dict[str, Any]` but read as attributes
+            // (OmegaConf and similar); basedpyright reports every such access as an
+            // error, so this fork turns that rule off unless the user set it. This
+            // must run after normalization and on both `analysis` copies: the merge
+            // above replaces `diagnosticSeverityOverrides` as a whole, so a default
+            // injected into one form earlier is dropped whenever the user set
+            // overrides in the other form.
+            for analysis_pointer in ["/basedpyright.analysis", "/basedpyright/analysis"] {
+                maybe!({
+                    let severity_overrides = user_settings
+                        .pointer_mut(analysis_pointer)?
+                        .as_object_mut()?
+                        .entry("diagnosticSeverityOverrides")
+                        .or_insert(Value::Object(serde_json::Map::default()))
+                        .as_object_mut()?;
+                    if let serde_json::map::Entry::Vacant(vacant) =
+                        severity_overrides.entry("reportAttributeAccessIssue")
+                    {
+                        vacant.insert(Value::String("none".to_owned()));
+                    }
+                    Some(())
+                });
+            }
             user_settings
         }))
     }
@@ -2492,6 +2515,24 @@ impl RuffLspAdapter {
 impl LspAdapter for RuffLspAdapter {
     fn name(&self) -> LanguageServerName {
         Self::SERVER_NAME
+    }
+
+    async fn initialization_options(
+        self: Arc<Self>,
+        _: &Arc<dyn LspAdapterDelegate>,
+        _: &mut AsyncApp,
+    ) -> Result<Option<Value>> {
+        // This fork ships ruff for formatting and import sorting only; lint
+        // diagnostics stay off unless the user enables them. The user's
+        // `lsp.ruff.initialization_options` are merged over this value, so
+        // `settings.lint.enable: true` turns them back on.
+        Ok(Some(json!({
+            "settings": {
+                "lint": {
+                    "enable": false
+                }
+            }
+        })))
     }
 
     async fn initialization_options_schema(
