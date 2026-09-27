@@ -1114,6 +1114,21 @@ impl SshRemoteConnection {
             .with_context(|| format!("failed to get metadata for {:?}", src_path))?;
         let size = src_stat.len();
 
+        // A retry after the tunnel dropped between upload and extraction finds the
+        // complete archive already on the host; uploading it again would saturate
+        // the tunnel for another two minutes and likely trigger the same drop.
+        match self.remote_file_size(tmp_path).await {
+            Ok(remote_size) if remote_size == size => {
+                log::info!(
+                    "remote development server already uploaded to {:?}, skipping upload",
+                    tmp_path
+                );
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) => log::debug!("no previous upload at {:?}: {error:#}", tmp_path),
+        }
+
         let t0 = Instant::now();
         delegate.set_status(Some("Uploading remote development server"), cx);
         log::info!(
@@ -1129,38 +1144,7 @@ impl SshRemoteConnection {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
 
-                let uploaded: Result<u64> = async {
-                    let tmp_path_display = tmp_path.display(self.path_style());
-                    let output = if self.ssh_platform.os.is_windows() {
-                        let shell_kind = ShellKind::Pwsh;
-                        let quoted_path = shell_kind
-                            .try_quote(&tmp_path_display)
-                            .context("shell quoting")?;
-                        let args = shell_kind
-                            .args_for_shell(false, format!("(Get-Item {quoted_path}).Length"));
-                        self.socket
-                            .run_command(self.ssh_shell_kind, "powershell", &args, true)
-                            .await?
-                    } else {
-                        self.socket
-                            .run_command(
-                                self.ssh_shell_kind,
-                                "wc",
-                                &["-c", tmp_path_display.as_ref()],
-                                true,
-                            )
-                            .await?
-                    };
-                    output
-                        .split_whitespace()
-                        .next()
-                        .context("empty remote file size output")?
-                        .parse::<u64>()
-                        .context("parsing remote file size")
-                }
-                .await;
-
-                let uploaded = match uploaded {
+                let uploaded = match self.remote_file_size(tmp_path).await {
                     Ok(uploaded) => uploaded,
                     Err(error) => {
                         log::debug!("could not read remote upload progress: {error:#}");
@@ -1187,6 +1171,35 @@ impl SshRemoteConnection {
         }
         log::info!("uploaded remote development server in {:?}", t0.elapsed());
         Ok(())
+    }
+
+    async fn remote_file_size(&self, path: &RelPath) -> Result<u64> {
+        let path_display = path.display(self.path_style());
+        let output = if self.ssh_platform.os.is_windows() {
+            let shell_kind = ShellKind::Pwsh;
+            let quoted_path = shell_kind
+                .try_quote(&path_display)
+                .context("shell quoting")?;
+            let args = shell_kind.args_for_shell(false, format!("(Get-Item {quoted_path}).Length"));
+            self.socket
+                .run_command(self.ssh_shell_kind, "powershell", &args, true)
+                .await?
+        } else {
+            self.socket
+                .run_command(
+                    self.ssh_shell_kind,
+                    "wc",
+                    &["-c", path_display.as_ref()],
+                    true,
+                )
+                .await?
+        };
+        output
+            .split_whitespace()
+            .next()
+            .context("empty remote file size output")?
+            .parse::<u64>()
+            .context("parsing remote file size")
     }
 
     async fn extract_server_binary(

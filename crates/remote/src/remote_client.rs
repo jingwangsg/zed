@@ -162,6 +162,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECT_RETRY_DELAY: Duration = Duration::from_secs(10);
 const MAX_RECONNECT_RETRY_DELAY: Duration = Duration::from_secs(20);
+const SSH_CONNECT_RETRY_DELAY: Duration = Duration::from_secs(30);
+const MAX_SSH_CONNECT_ATTEMPTS: usize = 3;
 const INITIAL_CONNECTION_TIMEOUT: Duration =
     Duration::from_secs(if cfg!(debug_assertions) { 5 } else { 60 });
 
@@ -385,13 +387,55 @@ pub async fn connect(
     delegate: Arc<dyn RemoteClientDelegate>,
     cx: &mut AsyncApp,
 ) -> Result<Arc<dyn RemoteConnection>> {
-    cx.update(|cx| {
-        cx.update_default_global(|pool: &mut ConnectionPool, cx| {
-            pool.connect(connection_options.clone(), delegate.clone(), cx)
-        })
-    })
-    .await
-    .map_err(|e| e.cloned())
+    // A port-forwarded tunnel restarted while the server binary is being
+    // uploaded refuses connections for 25 to 55 s, so connection-level SSH
+    // failures during the initial setup are retried. This lives here rather
+    // than in the pool because `RemoteClient::reconnect` calls the pool
+    // directly and already has its own retry schedule. Other failures
+    // (authentication, host key, user cancel) still surface immediately.
+    let mut attempt = 1;
+    loop {
+        let error = match cx
+            .update(|cx| {
+                cx.update_default_global(|pool: &mut ConnectionPool, cx| {
+                    pool.connect(connection_options.clone(), delegate.clone(), cx)
+                })
+            })
+            .await
+        {
+            Ok(connection) => return Ok(connection),
+            Err(error) => error.cloned(),
+        };
+        let message = format!("{error:#}");
+        let is_connection_failure = matches!(connection_options, RemoteConnectionOptions::Ssh(_))
+            && [
+                "Connection refused",
+                "Connection closed",
+                "Connection reset",
+            ]
+            .iter()
+            .any(|needle| message.contains(needle));
+        if !is_connection_failure || attempt >= MAX_SSH_CONNECT_ATTEMPTS {
+            return Err(error);
+        }
+        log::warn!(
+            "SSH connection attempt {attempt} failed, retrying in {}s: {message}",
+            SSH_CONNECT_RETRY_DELAY.as_secs()
+        );
+        delegate.set_status(
+            Some(&format!(
+                "Connection failed, retrying in {}s (attempt {} of {})",
+                SSH_CONNECT_RETRY_DELAY.as_secs(),
+                attempt + 1,
+                MAX_SSH_CONNECT_ATTEMPTS
+            )),
+            cx,
+        );
+        cx.background_executor()
+            .timer(SSH_CONNECT_RETRY_DELAY)
+            .await;
+        attempt += 1;
+    }
 }
 
 /// Returns `true` if the global [`ConnectionPool`] already has a live
