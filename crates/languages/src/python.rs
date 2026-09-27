@@ -2204,12 +2204,14 @@ impl LspAdapter for BasedPyrightLspAdapter {
 
             normalize_pyright_analysis_configuration(&mut user_settings, "basedpyright");
             // Config objects are often typed as `dict[str, Any]` but read as attributes
-            // (OmegaConf and similar); basedpyright reports every such access as an
-            // error, so this fork turns that rule off unless the user set it. This
-            // must run after normalization and on both `analysis` copies: the merge
-            // above replaces `diagnosticSeverityOverrides` as a whole, so a default
-            // injected into one form earlier is dropped whenever the user set
-            // overrides in the other form.
+            // (OmegaConf and similar), and `py.typed` libraries such as diffusers import
+            // their public names in `__init__.py` without the `as Name` / `__all__`
+            // re-export form pyright requires, so basedpyright reports every such
+            // access and every import of those names as an error. This fork turns
+            // those rules off unless the user set them. This must run after
+            // normalization and on both `analysis` copies: the merge above replaces
+            // `diagnosticSeverityOverrides` as a whole, so a default injected into one
+            // form earlier is dropped whenever the user set overrides in the other form.
             for analysis_pointer in ["/basedpyright.analysis", "/basedpyright/analysis"] {
                 maybe!({
                     let severity_overrides = user_settings
@@ -2218,10 +2220,12 @@ impl LspAdapter for BasedPyrightLspAdapter {
                         .entry("diagnosticSeverityOverrides")
                         .or_insert(Value::Object(serde_json::Map::default()))
                         .as_object_mut()?;
-                    if let serde_json::map::Entry::Vacant(vacant) =
-                        severity_overrides.entry("reportAttributeAccessIssue")
-                    {
-                        vacant.insert(Value::String("none".to_owned()));
+                    for rule in ["reportAttributeAccessIssue", "reportPrivateImportUsage"] {
+                        if let serde_json::map::Entry::Vacant(vacant) =
+                            severity_overrides.entry(rule)
+                        {
+                            vacant.insert(Value::String("none".to_owned()));
+                        }
                     }
                     Some(())
                 });
