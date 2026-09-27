@@ -108,7 +108,7 @@ See: [Working with Language Servers](https://zed.dev/docs/configuring-languages#
 
 Note that while basedpyright in isolation defaults to the `recommended` [type-checking mode](https://docs.basedpyright.com/latest/benefits-over-pyright/better-defaults/#typecheckingmode), Zed configures it to use the less-strict `standard` mode by default, which matches the behavior of Pyright. You can set the type-checking mode for your project using the `typeCheckingMode` setting in `pyrightconfig.json` or `pyproject.toml`, which will override Zed's default. Read on for more details about how to configure basedpyright.
 
-This fork also sets the `reportAttributeAccessIssue` and `reportPrivateImportUsage` rules to `none` unless you set them yourself under `lsp.basedpyright.settings.basedpyright.analysis.diagnosticSeverityOverrides`; other overrides you configure there are kept.
+This fork shows only basedpyright diagnostics that carry no rule code (syntax errors), hint-severity diagnostics (the faded unused/unreachable-code and deprecation hints), plus the `reportUndefinedVariable` and `reportMissingImports` rules. Every other rule is hidden regardless of the project's pyright configuration. This is done on the Zed side because basedpyright ignores the analysis settings Zed sends (`typeCheckingMode`, severity overrides) as soon as the project has a `[tool.pyright]` or `[tool.basedpyright]` section or a `pyrightconfig.json`.
 
 #### Basedpyright Configuration
 

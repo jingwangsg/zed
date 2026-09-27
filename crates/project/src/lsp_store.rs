@@ -897,12 +897,10 @@ impl LocalLspStore {
             .on_notification::<lsp::notification::PublishDiagnostics, _>({
                 let adapter = adapter.clone();
                 let this = lsp_store.clone();
-                move |mut params, cx| {
+                move |params, cx| {
                     let adapter = adapter.clone();
                     if let Some(this) = this.upgrade() {
                         this.update(cx, |this, cx| {
-                            adapter.process_diagnostics(&mut params, server_id);
-
                             this.merge_lsp_diagnostics(
                                 DiagnosticSourceKind::Pushed,
                                 vec![DocumentDiagnosticsUpdate {
@@ -13250,6 +13248,11 @@ impl LspStore {
         let mut supporting_diagnostics = HashMap::default();
 
         let adapter = self.language_server_adapter_for_id(server_id);
+        // Pushed and pulled diagnostics both arrive here, so the adapter hook covers
+        // both transports.
+        if let Some(adapter) = &adapter {
+            adapter.process_diagnostics(&mut lsp_diagnostics, server_id);
+        }
 
         // Ensure that primary diagnostics are always the most severe
         lsp_diagnostics

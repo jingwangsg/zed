@@ -9,7 +9,8 @@ use gpui::{App, AsyncApp, Entity, SharedString, Task};
 use http_client::github::{AssetKind, GitHubLspBinaryVersion, latest_github_release};
 use language::language_settings::LanguageSettings;
 use language::{
-    Buffer, ContextLocation, DynLspInstaller, LanguageToolchainStore, LspInstaller, Symbol,
+    Buffer, ContextLocation, DynLspInstaller, LanguageServerId, LanguageToolchainStore,
+    LspInstaller, Symbol,
 };
 use language::{ContextProvider, LspAdapter, LspAdapterDelegate};
 use language::{LanguageName, ManifestName, ManifestProvider, ManifestQuery};
@@ -2091,6 +2092,27 @@ impl LspAdapter for BasedPyrightLspAdapter {
         Self::SERVER_NAME
     }
 
+    fn process_diagnostics(&self, params: &mut lsp::PublishDiagnosticsParams, _: LanguageServerId) {
+        // basedpyright applies the analysis settings a client sends only when the
+        // project has no `[tool.pyright]`/`[tool.basedpyright]` section and no
+        // pyrightconfig.json (`_getConfigOptions` in its service.ts), so neither
+        // `typeCheckingMode` nor severity overrides can quiet its rules there. This
+        // fork keeps only what fails at runtime, diagnostics without a rule code
+        // (syntax errors), and hint-severity diagnostics (basedpyright's faded
+        // unused/unreachable-code and deprecation hints).
+        params.diagnostics.retain(|diagnostic| {
+            if diagnostic.severity == Some(lsp::DiagnosticSeverity::HINT) {
+                return true;
+            }
+            match &diagnostic.code {
+                Some(lsp::NumberOrString::String(rule)) => {
+                    rule == "reportUndefinedVariable" || rule == "reportMissingImports"
+                }
+                _ => true,
+            }
+        });
+    }
+
     async fn initialization_options(
         self: Arc<Self>,
         _: &Arc<dyn LspAdapterDelegate>,
@@ -2203,33 +2225,6 @@ impl LspAdapter for BasedPyrightLspAdapter {
             }
 
             normalize_pyright_analysis_configuration(&mut user_settings, "basedpyright");
-            // Config objects are often typed as `dict[str, Any]` but read as attributes
-            // (OmegaConf and similar), and `py.typed` libraries such as diffusers import
-            // their public names in `__init__.py` without the `as Name` / `__all__`
-            // re-export form pyright requires, so basedpyright reports every such
-            // access and every import of those names as an error. This fork turns
-            // those rules off unless the user set them. This must run after
-            // normalization and on both `analysis` copies: the merge above replaces
-            // `diagnosticSeverityOverrides` as a whole, so a default injected into one
-            // form earlier is dropped whenever the user set overrides in the other form.
-            for analysis_pointer in ["/basedpyright.analysis", "/basedpyright/analysis"] {
-                maybe!({
-                    let severity_overrides = user_settings
-                        .pointer_mut(analysis_pointer)?
-                        .as_object_mut()?
-                        .entry("diagnosticSeverityOverrides")
-                        .or_insert(Value::Object(serde_json::Map::default()))
-                        .as_object_mut()?;
-                    for rule in ["reportAttributeAccessIssue", "reportPrivateImportUsage"] {
-                        if let serde_json::map::Entry::Vacant(vacant) =
-                            severity_overrides.entry(rule)
-                        {
-                            vacant.insert(Value::String("none".to_owned()));
-                        }
-                    }
-                    Some(())
-                });
-            }
             user_settings
         }))
     }
@@ -2771,11 +2766,14 @@ impl LspInstaller for RuffLspAdapter {
 mod tests {
     use gpui::{AppContext as _, BorrowAppContext, Context, TestAppContext};
     use language::{AutoindentMode, Buffer};
+    use language::{LanguageServerId, LspAdapter as _};
+    use node_runtime::NodeRuntime;
     use settings::SettingsStore;
     use std::num::NonZeroU32;
 
     use crate::python::{
-        normalize_pyright_analysis_configuration, python_module_name_from_relative_path,
+        BasedPyrightLspAdapter, normalize_pyright_analysis_configuration,
+        python_module_name_from_relative_path,
     };
 
     #[test]
@@ -2894,6 +2892,57 @@ mod tests {
                     "typeCheckingMode": "basic"
                 }
             })
+        );
+    }
+
+    #[test]
+    fn basedpyright_diagnostics_keep_only_runtime_failures() {
+        let error = lsp::DiagnosticSeverity::ERROR;
+        let warning = lsp::DiagnosticSeverity::WARNING;
+        let hint = lsp::DiagnosticSeverity::HINT;
+
+        let diagnostic = |code: Option<&str>, severity: lsp::DiagnosticSeverity| lsp::Diagnostic {
+            code: code.map(|code| lsp::NumberOrString::String(code.to_owned())),
+            severity: Some(severity),
+            ..Default::default()
+        };
+        let mut params = lsp::PublishDiagnosticsParams {
+            uri: lsp::Uri::from_file_path(util::path!("/a.py")).expect("valid file path"),
+            version: None,
+            diagnostics: vec![
+                diagnostic(None, error),
+                diagnostic(Some("reportUndefinedVariable"), error),
+                diagnostic(Some("reportUnknownMemberType"), warning),
+                diagnostic(Some("reportMissingImports"), error),
+                diagnostic(Some("reportAttributeAccessIssue"), error),
+                diagnostic(Some("reportUnusedImport"), hint),
+                diagnostic(Some("reportUnusedImport"), warning),
+                diagnostic(Some("reportPrivateImportUsage"), error),
+            ],
+        };
+
+        BasedPyrightLspAdapter::new(NodeRuntime::unavailable())
+            .process_diagnostics(&mut params, LanguageServerId(0));
+
+        let kept: Vec<(Option<&str>, Option<lsp::DiagnosticSeverity>)> = params
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let code = match &diagnostic.code {
+                    Some(lsp::NumberOrString::String(rule)) => Some(rule.as_str()),
+                    _ => None,
+                };
+                (code, diagnostic.severity)
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                (None, Some(error)),
+                (Some("reportUndefinedVariable"), Some(error)),
+                (Some("reportMissingImports"), Some(error)),
+                (Some("reportUnusedImport"), Some(hint)),
+            ]
         );
     }
 
