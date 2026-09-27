@@ -1121,9 +1121,70 @@ impl SshRemoteConnection {
             tmp_path,
             size / 1024
         );
-        self.upload_file(src_path, tmp_path)
-            .await
-            .context("failed to upload server binary")?;
+
+        // sftp/scp expose no progress while running, but both grow the destination
+        // file in place, so poll its size over the control socket until the upload
+        // branch of the select completes and drops this one.
+        let report_progress = async {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+
+                let uploaded: Result<u64> = async {
+                    let tmp_path_display = tmp_path.display(self.path_style());
+                    let output = if self.ssh_platform.os.is_windows() {
+                        let shell_kind = ShellKind::Pwsh;
+                        let quoted_path = shell_kind
+                            .try_quote(&tmp_path_display)
+                            .context("shell quoting")?;
+                        let args = shell_kind
+                            .args_for_shell(false, format!("(Get-Item {quoted_path}).Length"));
+                        self.socket
+                            .run_command(self.ssh_shell_kind, "powershell", &args, true)
+                            .await?
+                    } else {
+                        self.socket
+                            .run_command(
+                                self.ssh_shell_kind,
+                                "wc",
+                                &["-c", tmp_path_display.as_ref()],
+                                true,
+                            )
+                            .await?
+                    };
+                    output
+                        .split_whitespace()
+                        .next()
+                        .context("empty remote file size output")?
+                        .parse::<u64>()
+                        .context("parsing remote file size")
+                }
+                .await;
+
+                let uploaded = match uploaded {
+                    Ok(uploaded) => uploaded,
+                    Err(error) => {
+                        log::debug!("could not read remote upload progress: {error:#}");
+                        continue;
+                    }
+                };
+                let percent = (uploaded * 100 / size.max(1)).min(100);
+                delegate.set_status(
+                    Some(&format!(
+                        "Uploading remote development server ({percent}%, {:.1} of {:.1} MB)",
+                        uploaded as f64 / (1024.0 * 1024.0),
+                        size as f64 / (1024.0 * 1024.0),
+                    )),
+                    cx,
+                );
+            }
+        };
+
+        select_biased! {
+            result = self.upload_file(src_path, tmp_path).fuse() => {
+                result.context("failed to upload server binary")?;
+            }
+            _ = report_progress.fuse() => {}
+        }
         log::info!("uploaded remote development server in {:?}", t0.elapsed());
         Ok(())
     }
