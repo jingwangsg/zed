@@ -146,6 +146,7 @@ message UpdateRepository {
   optional string repository_dir_abs_path = 19;
   optional string common_dir_abs_path = 20;
   optional string branch_list_error = 21;
+  optional GitInProgressOperation in_progress_operation = 22;
 }
 
 message RemoveRepository {
@@ -322,6 +323,7 @@ message GitReset {
   enum ResetMode {
     SOFT = 0;
     MIXED = 1;
+    HARD = 2;
   }
 }
 
@@ -331,6 +333,70 @@ message GitCheckoutFiles {
   uint64 repository_id = 3;
   string commit = 4;
   repeated string paths = 5;
+}
+
+message GitCherryPick {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  repeated string commits = 3;
+}
+
+message GitRevert {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  repeated string commits = 3;
+}
+
+message GitCheckoutCommit {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string commit = 3;
+}
+
+message GitCreateTag {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string name = 3;
+  string commit = 4;
+  optional string message = 5;
+}
+
+message GitMerge {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string branch = 3;
+  MergeKind kind = 4;
+  enum MergeKind {
+    DEFAULT = 0;
+    NO_FAST_FORWARD = 1;
+    FAST_FORWARD_ONLY = 2;
+    SQUASH = 3;
+  }
+}
+
+message GitRebase {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string onto = 3;
+}
+
+enum GitInProgressOperation {
+  MERGE = 0;
+  REBASE = 1;
+  CHERRY_PICK = 2;
+  REVERT = 3;
+}
+
+message GitResolveInProgressOperation {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  GitInProgressOperation operation = 3;
+  Action action = 4;
+  enum Action {
+    CONTINUE = 0;
+    ABORT = 1;
+    SKIP = 2;
+  }
 }
 
 message GitAddPathToGitignore {

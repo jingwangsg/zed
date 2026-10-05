@@ -1,3 +1,4 @@
+use editor::Editor;
 use futures::channel::oneshot;
 use fuzzy::{StringMatch, StringMatchCandidate};
 
@@ -11,6 +12,96 @@ use std::sync::Arc;
 use ui::{HighlightedLabel, ListItem, ListItemSpacing, prelude::*};
 use util::ResultExt;
 use workspace::{ModalView, Workspace};
+
+/// Resolves to `None` when the prompt is dismissed.
+pub fn text_prompt(
+    title: impl Into<SharedString>,
+    placeholder: impl Into<Arc<str>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<Option<String>> {
+    let title = title.into();
+    let placeholder = placeholder.into();
+    window.spawn(cx, async move |cx| {
+        let (tx, rx) = oneshot::channel();
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    TextPrompt::new(title, placeholder, tx, window, cx)
+                })
+            })
+            .ok();
+        rx.await.ok()
+    })
+}
+
+pub struct TextPrompt {
+    title: SharedString,
+    editor: Entity<Editor>,
+    response: Option<oneshot::Sender<String>>,
+}
+
+impl TextPrompt {
+    fn new(
+        title: SharedString,
+        placeholder: Arc<str>,
+        response: oneshot::Sender<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text(&placeholder, window, cx);
+            editor
+        });
+        Self {
+            title,
+            editor,
+            response: Some(response),
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).text(cx).trim().to_owned();
+        if let Some(response) = self.response.take() {
+            response.send(text).ok();
+        }
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for TextPrompt {}
+impl ModalView for TextPrompt {}
+impl Focusable for TextPrompt {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for TextPrompt {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("TextPrompt")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(34.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .w_full()
+                    .child(Headline::new(self.title.clone()).size(HeadlineSize::XSmall)),
+            )
+            .child(div().px_3().pb_3().w_full().child(self.editor.clone()))
+    }
+}
 
 pub struct PickerPrompt {
     pub picker: Entity<Picker<PickerPromptDelegate>>,

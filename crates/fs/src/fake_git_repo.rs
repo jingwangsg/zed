@@ -13,9 +13,9 @@ use git::{
     repository::{
         AskPassDelegate, Branch, CommitData, CommitDataReader, CommitDetails, CommitOptions,
         CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, GRAPH_CHUNK_SIZE,
-        GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
-        PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
-        commit_hash_search_query,
+        GitRepository, GitRepositoryCheckpoint, InProgressOperation, InProgressOperationAction,
+        InitialGraphCommitData, LogOrder, LogSource, MergeKind, PushOptions, RefEdit, Remote,
+        RepoPath, ResetMode, SearchCommitArgs, Worktree, commit_hash_search_query,
     },
     stash::GitStash,
     status::{
@@ -357,7 +357,9 @@ impl GitRepository for FakeGitRepository {
                 ResetMode::Soft => {
                     state.head_contents = snapshot.head_contents;
                 }
-                ResetMode::Mixed => {
+                // load-bearing: the fake keeps no worktree contents of its own, so a hard
+                // reset cannot do more than a mixed one here.
+                ResetMode::Mixed | ResetMode::Hard => {
                     state.head_contents = snapshot.head_contents;
                     state.index_contents = state.head_contents.clone();
                 }
@@ -375,6 +377,83 @@ impl GitRepository for FakeGitRepository {
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         unimplemented!()
+    }
+
+    fn cherry_pick(
+        &self,
+        _commits: Vec<String>,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        unimplemented!()
+    }
+
+    fn revert(
+        &self,
+        _commits: Vec<String>,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        unimplemented!()
+    }
+
+    fn checkout_commit(
+        &self,
+        _commit: String,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        unimplemented!()
+    }
+
+    fn create_tag(
+        &self,
+        name: String,
+        commit: String,
+        _message: Option<String>,
+    ) -> BoxFuture<'_, Result<()>> {
+        self.edit_ref(RefEdit::Update {
+            ref_name: format!("refs/tags/{name}"),
+            commit,
+        })
+    }
+
+    fn merge(
+        &self,
+        _branch: String,
+        _kind: MergeKind,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        unimplemented!()
+    }
+
+    fn rebase(
+        &self,
+        _onto: String,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        unimplemented!()
+    }
+
+    fn resolve_in_progress_operation(
+        &self,
+        _operation: InProgressOperation,
+        _action: InProgressOperationAction,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        unimplemented!()
+    }
+
+    fn in_progress_operation(&self) -> BoxFuture<'_, Option<InProgressOperation>> {
+        let operation = self.with_state_async(false, |state| {
+            Ok([
+                ("REBASE_HEAD", InProgressOperation::Rebase),
+                ("CHERRY_PICK_HEAD", InProgressOperation::CherryPick),
+                ("REVERT_HEAD", InProgressOperation::Revert),
+                ("MERGE_HEAD", InProgressOperation::Merge),
+            ]
+            .into_iter()
+            .find(|(head, _)| state.refs.contains_key(*head))
+            .map(|(_, operation)| operation))
+        });
+        async move { operation.await.ok().flatten() }.boxed()
     }
 
     fn path(&self) -> PathBuf {

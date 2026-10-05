@@ -661,6 +661,54 @@ pub enum ResetMode {
     /// Reset the branch pointer and index, leave worktree unchanged (this makes it look as though things that were
     /// committed are now unstaged).
     Mixed,
+    /// Reset the branch pointer, index and worktree, discarding all local changes.
+    Hard,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeKind {
+    /// Fast-forward when possible, otherwise create a merge commit.
+    Default,
+    NoFastForward,
+    FastForwardOnly,
+    Squash,
+}
+
+/// A multi-step git operation that can pause on conflicts and be resumed or abandoned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InProgressOperation {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+}
+
+impl InProgressOperation {
+    pub fn subcommand(self) -> &'static str {
+        match self {
+            InProgressOperation::Merge => "merge",
+            InProgressOperation::Rebase => "rebase",
+            InProgressOperation::CherryPick => "cherry-pick",
+            InProgressOperation::Revert => "revert",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InProgressOperationAction {
+    Continue,
+    Abort,
+    Skip,
+}
+
+impl InProgressOperationAction {
+    pub fn flag(self) -> &'static str {
+        match self {
+            InProgressOperationAction::Continue => "--continue",
+            InProgressOperationAction::Abort => "--abort",
+            InProgressOperationAction::Skip => "--skip",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -915,6 +963,51 @@ pub trait GitRepository: Send + Sync {
         paths: Vec<RepoPath>,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>>;
+
+    fn cherry_pick(
+        &self,
+        commits: Vec<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>>;
+
+    fn revert(
+        &self,
+        commits: Vec<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>>;
+
+    /// Checks out a commit or tag, leaving HEAD detached.
+    fn checkout_commit(
+        &self,
+        commit: String,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>>;
+
+    /// Creates a tag at the given commit; a message makes it an annotated tag.
+    fn create_tag(
+        &self,
+        name: String,
+        commit: String,
+        message: Option<String>,
+    ) -> BoxFuture<'_, Result<()>>;
+
+    fn merge(
+        &self,
+        branch: String,
+        kind: MergeKind,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>>;
+
+    fn rebase(&self, onto: String, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>>;
+
+    fn resolve_in_progress_operation(
+        &self,
+        operation: InProgressOperation,
+        action: InProgressOperationAction,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>>;
+
+    fn in_progress_operation(&self) -> BoxFuture<'_, Option<InProgressOperation>>;
 
     fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>>;
 
@@ -1572,6 +1665,7 @@ impl GitRepository for RealGitRepository {
             let mode_flag = match mode {
                 ResetMode::Mixed => "--mixed",
                 ResetMode::Soft => "--soft",
+                ResetMode::Hard => "--hard",
             };
 
             let output = git
@@ -1616,6 +1710,142 @@ impl GitRepository for RealGitRepository {
             Ok(())
         }
         .boxed()
+    }
+
+    fn cherry_pick(
+        &self,
+        commits: Vec<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        async move {
+            let mut args = vec!["cherry-pick".to_string()];
+            args.extend(commits);
+            git?.run_with_env(&args, &env).await?;
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn revert(
+        &self,
+        commits: Vec<String>,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        async move {
+            let mut args = vec!["revert".to_string(), "--no-edit".to_string()];
+            args.extend(commits);
+            git?.run_with_env(&args, &env).await?;
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn checkout_commit(
+        &self,
+        commit: String,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        async move {
+            git?.run_with_env(&["checkout", "--detach", &commit], &env)
+                .await?;
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn create_tag(
+        &self,
+        name: String,
+        commit: String,
+        message: Option<String>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let mut args = vec!["tag"];
+                if let Some(message) = message.as_deref() {
+                    args.extend(["--annotate", "--message", message]);
+                }
+                args.extend([name.as_str(), commit.as_str()]);
+                git.run(&args).await?;
+                Ok(())
+            })
+            .boxed()
+    }
+
+    fn merge(
+        &self,
+        branch: String,
+        kind: MergeKind,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        async move {
+            let mut args = vec!["merge", "--no-edit"];
+            match kind {
+                MergeKind::Default => {}
+                MergeKind::NoFastForward => args.push("--no-ff"),
+                MergeKind::FastForwardOnly => args.push("--ff-only"),
+                MergeKind::Squash => args.push("--squash"),
+            }
+            args.push(&branch);
+            git?.run_with_env(&args, &env).await?;
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn rebase(&self, onto: String, env: Arc<HashMap<String, String>>) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        async move {
+            git?.run_with_env(&["rebase", &onto], &env).await?;
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn resolve_in_progress_operation(
+        &self,
+        operation: InProgressOperation,
+        action: InProgressOperationAction,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        async move {
+            git?.run_with_env(&[operation.subcommand(), action.flag()], &env)
+                .await?;
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn in_progress_operation(&self) -> BoxFuture<'_, Option<InProgressOperation>> {
+        let git_dir = self.path();
+        self.executor
+            .spawn(async move {
+                // This mirrors `git status`: the rebase state directories are checked
+                // rather than `REBASE_HEAD`, which git leaves behind after a rebase
+                // finishes, and they take precedence over the head files that a paused
+                // rebase step may also write. `rebase-apply` is shared with `git am`,
+                // which marks its sessions with `applying` instead of `rebasing`.
+                if git_dir.join("rebase-merge").exists()
+                    || git_dir.join("rebase-apply/rebasing").exists()
+                {
+                    Some(InProgressOperation::Rebase)
+                } else if git_dir.join("CHERRY_PICK_HEAD").exists() {
+                    Some(InProgressOperation::CherryPick)
+                } else if git_dir.join("REVERT_HEAD").exists() {
+                    Some(InProgressOperation::Revert)
+                } else if git_dir.join("MERGE_HEAD").exists() {
+                    Some(InProgressOperation::Merge)
+                } else {
+                    None
+                }
+            })
+            .boxed()
     }
 
     fn load_blob_content(&self, oid: Oid) -> BoxFuture<'_, Result<Vec<u8>>> {
@@ -3958,6 +4188,22 @@ impl GitBinary {
         Ok(stdout)
     }
 
+    /// Runs a command with the project environment applied, for operations that may run hooks.
+    /// `GIT_EDITOR` is forced to `true` so that commands which would normally open an editor
+    /// (for example `rebase --continue`) accept their default message instead of blocking;
+    /// the project environment may otherwise carry `GIT_EDITOR="zed --wait"`.
+    pub async fn run_with_env<S>(mut self, args: &[S], env: &HashMap<String, String>) -> Result<()>
+    where
+        S: AsRef<OsStr>,
+    {
+        self.envs
+            .extend(env.iter().map(|(key, value)| (key.clone(), value.clone())));
+        self.envs
+            .insert("GIT_EDITOR".to_string(), "true".to_string());
+        self.run(args).await?;
+        Ok(())
+    }
+
     /// Returns the result of the command without trimming the trailing newline.
     pub async fn run_raw<S>(&self, args: &[S]) -> Result<String>
     where
@@ -4362,6 +4608,194 @@ mod tests {
     fn git_init_repo(path: &Path) {
         fs::create_dir_all(path).expect("failed to create repo directory");
         git_command(path, ["init", "-b", "main"]);
+    }
+
+    #[gpui::test]
+    async fn test_cherry_pick_revert_tag_and_detached_checkout(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let path = repo_dir.path();
+        git_init_repo(path);
+        fs::write(path.join("a.txt"), "a").unwrap();
+        git_command(path, ["add", "a.txt"]);
+        git_command(path, ["commit", "-m", "initial"]);
+        git_command(path, ["switch", "-c", "feature"]);
+        fs::write(path.join("b.txt"), "b").unwrap();
+        git_command(path, ["add", "b.txt"]);
+        git_command(path, ["commit", "-m", "add b"]);
+        let feature_sha = git_command_output(path, ["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        git_command(path, ["switch", "main"]);
+        fs::write(path.join("c.txt"), "c").unwrap();
+        git_command(path, ["add", "c.txt"]);
+        git_command(path, ["commit", "-m", "add c"]);
+        let main_sha = git_command_output(path, ["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+        let env = Arc::new(test_commit_envs());
+
+        repository
+            .cherry_pick(vec![feature_sha.clone()], env.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            git_command_output(path, ["log", "-1", "--format=%s"]).trim(),
+            "add b"
+        );
+        assert!(path.join("b.txt").exists());
+
+        let cherry_picked_sha = git_command_output(path, ["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        repository
+            .revert(vec![cherry_picked_sha], env.clone())
+            .await
+            .unwrap();
+        assert!(git_command_output(path, ["log", "-1", "--format=%s"]).starts_with("Revert"));
+        assert!(!path.join("b.txt").exists());
+
+        repository
+            .create_tag("lightweight".into(), main_sha.clone(), None)
+            .await
+            .unwrap();
+        repository
+            .create_tag("annotated".into(), main_sha.clone(), Some("release".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            git_command_output(path, ["rev-parse", "lightweight"]).trim(),
+            main_sha
+        );
+        assert_eq!(
+            git_command_output(path, ["cat-file", "-t", "annotated"]).trim(),
+            "tag"
+        );
+        assert_eq!(
+            git_command_output(path, ["rev-parse", "annotated^{commit}"]).trim(),
+            main_sha
+        );
+
+        repository
+            .checkout_commit(main_sha.clone(), env.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            git_command_output(path, ["rev-parse", "HEAD"]).trim(),
+            main_sha
+        );
+        assert_eq!(
+            git_command_output(path, ["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "HEAD"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_merge_rebase_and_in_progress_operations(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let path = repo_dir.path();
+        git_init_repo(path);
+        fs::write(path.join("file.txt"), "base\n").unwrap();
+        git_command(path, ["add", "file.txt"]);
+        git_command(path, ["commit", "-m", "initial"]);
+        git_command(path, ["switch", "-c", "feature"]);
+        fs::write(path.join("file.txt"), "feature\n").unwrap();
+        git_command(path, ["commit", "-am", "feature change"]);
+        git_command(path, ["switch", "main"]);
+        fs::write(path.join("file.txt"), "main\n").unwrap();
+        git_command(path, ["commit", "-am", "main change"]);
+        git_command(path, ["switch", "-c", "topic"]);
+        fs::write(path.join("topic.txt"), "topic\n").unwrap();
+        git_command(path, ["add", "topic.txt"]);
+        git_command(path, ["commit", "-m", "topic change"]);
+        git_command(path, ["switch", "main"]);
+
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+        // `GIT_EDITOR=false` makes any command that opens an editor fail, so these
+        // operations only pass if they override it and never wait for user input.
+        let mut env = test_commit_envs();
+        env.insert("GIT_EDITOR".to_string(), "false".to_string());
+        let env = Arc::new(env);
+
+        repository
+            .merge("feature".into(), MergeKind::Default, env.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            repository.in_progress_operation().await,
+            Some(InProgressOperation::Merge)
+        );
+        repository
+            .resolve_in_progress_operation(
+                InProgressOperation::Merge,
+                InProgressOperationAction::Abort,
+                env.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repository.in_progress_operation().await, None);
+        assert_eq!(fs::read_to_string(path.join("file.txt")).unwrap(), "main\n");
+
+        repository
+            .merge("topic".into(), MergeKind::NoFastForward, env.clone())
+            .await
+            .unwrap();
+        let parents = git_command_output(path, ["rev-list", "--parents", "-1", "HEAD"]);
+        assert_eq!(parents.split_whitespace().count(), 3);
+        assert!(path.join("topic.txt").exists());
+
+        git_command(path, ["switch", "feature"]);
+        repository
+            .rebase("main".into(), env.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            repository.in_progress_operation().await,
+            Some(InProgressOperation::Rebase)
+        );
+        fs::write(path.join("file.txt"), "resolved\n").unwrap();
+        git_command(path, ["add", "file.txt"]);
+        repository
+            .resolve_in_progress_operation(
+                InProgressOperation::Rebase,
+                InProgressOperationAction::Continue,
+                env.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repository.in_progress_operation().await, None);
+        let main_sha = git_command_output(path, ["rev-parse", "main"])
+            .trim()
+            .to_string();
+        assert_eq!(
+            git_command_output(path, ["rev-parse", "HEAD^"]).trim(),
+            main_sha
+        );
+        assert_eq!(
+            git_command_output(path, ["log", "-1", "--format=%s"]).trim(),
+            "feature change"
+        );
+
+        fs::write(path.join("file.txt"), "dirty\n").unwrap();
+        repository
+            .reset("HEAD".into(), ResetMode::Hard, env.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(path.join("file.txt")).unwrap(),
+            "resolved\n"
+        );
     }
 
     fn clone_remote_repository_with_main_and_feature(temp_dir: &Path) -> (PathBuf, PathBuf) {

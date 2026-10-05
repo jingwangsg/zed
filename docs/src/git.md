@@ -193,6 +193,26 @@ To delete a branch, open the branch switcher with {#action git::Switch}, find th
 
 > **Note:** You cannot delete the branch you currently have checked out. Switch to a different branch first.
 
+### Merging and Rebasing
+
+Use {#action git::MergeBranch} to pick a branch and merge it into the current branch, or {#action git::RebaseOntoBranch} to rebase the current branch onto a picked branch.
+
+In the Git Graph, right-click a branch label for the same operations with more options: switch to the branch, merge it with a regular, `--no-ff`, `--ff-only`, or squash merge, rebase onto it, or, for a local branch other than the current one, delete it. Right-click a tag label to check it out or delete it.
+
+When a merge or rebase stops on conflicts, see [Continuing or Aborting](#continuing-or-aborting).
+
+## Commit Operations
+
+Right-click a commit in the Git Graph or in the Git Panel's History tab to act on it:
+
+- **Checkout Commit**: check out the commit with a detached `HEAD`
+- **Cherry-Pick Commit** and **Revert Commit**: apply or undo the commit on the current branch
+- **Reset Current Branch to Commit**: soft, mixed, or hard reset; a hard reset asks for confirmation because it discards uncommitted changes
+- **Create and Switch to Branch at Commit**: prompt for a branch name, then create the branch there and check it out
+- **Create Tag at Commit**: prompt for a tag name and an optional message; a message makes the tag annotated
+
+A cherry-pick or revert that stops on conflicts is resumed the same way as a merge, see [Continuing or Aborting](#continuing-or-aborting).
+
 ## Git Worktrees
 
 Git worktrees let you keep multiple checkouts of the same repository on disk at the same time.
@@ -248,6 +268,10 @@ Each conflict shows three buttons:
 - **Use Both**: Keep both sets of changes, with your branch's changes first
 
 Click a button to resolve that conflict. The conflict markers are removed and replaced with your chosen content. After resolving all conflicts in a file, stage it and commit to complete the merge.
+
+### Continuing or Aborting
+
+While a merge, rebase, cherry-pick, or revert is in progress, the Git Panel shows a bar above the commit message editor with **Continue**, **Skip**, and **Abort** buttons. **Continue** stays disabled until every conflict is resolved and staged. **Skip** is not shown for a merge, since git has no commit to skip there. The same operations are available as {#action git::ContinueOperation}, {#action git::SkipOperation}, and {#action git::AbortOperation}.
 
 > **Tip:** For complex conflicts that need manual editing, you can edit the file directly. Remove the conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) and keep the content you want.
 
@@ -422,6 +446,11 @@ When viewing files with changes, Zed displays diff hunks that can be expanded or
 | {#action git::StashPop}                   | {#kb git::StashPop}                   |
 | {#action git::StashApply}                 | {#kb git::StashApply}                 |
 | {#action git::ViewStash}                  | {#kb git::ViewStash}                  |
+| {#action git::MergeBranch}                | {#kb git::MergeBranch}                |
+| {#action git::RebaseOntoBranch}           | {#kb git::RebaseOntoBranch}           |
+| {#action git::ContinueOperation}          | {#kb git::ContinueOperation}          |
+| {#action git::SkipOperation}              | {#kb git::SkipOperation}              |
+| {#action git::AbortOperation}             | {#kb git::AbortOperation}             |
 | {#action editor::ToggleGitBlameInline}    | {#kb editor::ToggleGitBlameInline}    |
 | {#action editor::ExpandAllDiffHunks}      | {#kb editor::ExpandAllDiffHunks}      |
 | {#action editor::ToggleSelectedDiffHunks} | {#kb editor::ToggleSelectedDiffHunks} |

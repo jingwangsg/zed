@@ -1,6 +1,9 @@
-use anyhow::anyhow;
+use anyhow::{Result, anyhow};
 use commit_modal::CommitModal;
 use editor::{Editor, actions::DiffClipboardWithSelectionData};
+use futures::channel::oneshot;
+use std::future::Future;
+use std::sync::Arc;
 
 use workspace::{Toast, notifications::NotificationId};
 
@@ -8,7 +11,9 @@ mod blame_ui;
 pub mod clone;
 
 use git::{
-    repository::{Branch, CommitDetails, Upstream, UpstreamTracking, UpstreamTrackingStatus},
+    repository::{
+        Branch, CommitDetails, MergeKind, Upstream, UpstreamTracking, UpstreamTrackingStatus,
+    },
     status::{FileStatus, StatusCode, UnmergedStatus, UnmergedStatusCode},
 };
 use gpui::{
@@ -310,6 +315,40 @@ pub fn init(cx: &mut App) {
             panel.update(cx, |panel, cx| {
                 panel.uncommit(window, cx);
             })
+        });
+        workspace.register_action(|workspace, _: &git::MergeBranch, window, cx| {
+            pick_branch_for_operation(workspace, "merge", window, cx, |repository, branch, cx| {
+                repository.merge(branch, MergeKind::Default, cx)
+            });
+        });
+        workspace.register_action(|workspace, _: &git::RebaseOntoBranch, window, cx| {
+            pick_branch_for_operation(workspace, "rebase", window, cx, |repository, branch, cx| {
+                repository.rebase(branch, cx)
+            });
+        });
+        workspace.register_action(|workspace, action: &git::ContinueOperation, window, cx| {
+            let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |panel, cx| {
+                panel.continue_operation(action, window, cx);
+            });
+        });
+        workspace.register_action(|workspace, action: &git::AbortOperation, window, cx| {
+            let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |panel, cx| {
+                panel.abort_operation(action, window, cx);
+            });
+        });
+        workspace.register_action(|workspace, action: &git::SkipOperation, window, cx| {
+            let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |panel, cx| {
+                panel.skip_operation(action, window, cx);
+            });
         });
         workspace.register_action(|workspace, _action: &git::Init, window, cx| {
             let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
@@ -1350,6 +1389,68 @@ impl Render for GitCloneModal {
 impl EventEmitter<DismissEvent> for GitCloneModal {}
 
 impl ModalView for GitCloneModal {}
+
+pub(crate) fn report_git_operation(
+    workspace: WeakEntity<Workspace>,
+    action: impl Into<SharedString>,
+    operation: impl Future<Output = Result<()>> + 'static,
+    cx: &mut App,
+) {
+    let action = action.into();
+    cx.spawn(async move |cx| {
+        if let Err(error) = operation.await {
+            cx.update(|cx| {
+                if let Some(workspace) = workspace.upgrade() {
+                    git_ui_core::notifications::show_error_toast(workspace, action, error, cx);
+                }
+            });
+        }
+    })
+    .detach();
+}
+
+fn pick_branch_for_operation(
+    workspace: &mut Workspace,
+    action: &'static str,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+    operation: impl Fn(
+        &mut Repository,
+        String,
+        &mut Context<Repository>,
+    ) -> oneshot::Receiver<Result<()>>
+    + 'static,
+) {
+    let Some(repository) = workspace.project().read(cx).active_repository(cx) else {
+        return;
+    };
+    let workspace_handle = workspace.weak_handle();
+    let on_select: branch_picker::SelectBranchCallback = Arc::new({
+        let repository = repository.clone();
+        let workspace = workspace_handle.clone();
+        move |branch: Branch, _window: &mut Window, cx: &mut App| {
+            let receiver = repository.update(cx, |repository, cx| {
+                operation(repository, branch.name().to_owned(), cx)
+            });
+            report_git_operation(
+                workspace.clone(),
+                action,
+                async move { receiver.await? },
+                cx,
+            );
+        }
+    });
+    workspace.toggle_modal(window, cx, |window, cx| {
+        branch_picker::select_modal(
+            workspace_handle,
+            Some(repository),
+            None,
+            on_select,
+            window,
+            cx,
+        )
+    });
+}
 
 #[cfg(test)]
 mod view_commit_tests {

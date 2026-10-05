@@ -13,7 +13,7 @@ use crate::remote_output::{self, RemoteAction, SuccessMessage};
 use crate::solo_diff_view::SoloDiffView;
 use crate::staged_diff::StagedDiff;
 use crate::unstaged_diff::UnstagedDiff;
-use crate::{branch_picker, picker_prompt, render_remote_button};
+use crate::{branch_picker, picker_prompt, render_remote_button, report_git_operation};
 use crate::{
     git_panel_settings::GitPanelSettings, git_status_icon, repository_selector::RepositorySelector,
 };
@@ -32,9 +32,9 @@ use git::Oid;
 use git::commit::ParsedCommitMessage;
 use git::repository::{
     Branch, CommitData, CommitDetails, CommitOptions, CommitSummary, DiffType, FetchOptions,
-    GitCommitTemplate, GitCommitter, InitialGraphCommitData, LogOrder, LogSource, PushOptions,
-    Remote, RemoteCommandOutput, ResetMode, Upstream, UpstreamTracking, UpstreamTrackingStatus,
-    get_git_committer,
+    GitCommitTemplate, GitCommitter, InProgressOperation, InProgressOperationAction,
+    InitialGraphCommitData, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput,
+    ResetMode, Upstream, UpstreamTracking, UpstreamTrackingStatus, get_git_committer,
 };
 use git::stash::GitStash;
 use git::status::{DiffStat, StageStatus};
@@ -1380,7 +1380,9 @@ impl GitPanel {
                 move |this, _git_store, event, window, cx| match event {
                     GitStoreEvent::RepositoryUpdated(
                         _,
-                        RepositoryEvent::StatusesChanged | RepositoryEvent::HeadChanged,
+                        RepositoryEvent::StatusesChanged
+                        | RepositoryEvent::HeadChanged
+                        | RepositoryEvent::TagsChanged,
                         true,
                     )
                     | GitStoreEvent::RepositoryAdded
@@ -6583,6 +6585,7 @@ impl GitPanel {
                 head_commit,
                 Some(git_panel),
             ))
+            .children(self.render_in_progress_operation(cx))
             .when(title_exceeds_limit, |this| {
                 this.child(
                     h_flex()
@@ -6742,6 +6745,135 @@ impl GitPanel {
                 )
                 .into_any_element(),
             ))
+    }
+
+    fn render_in_progress_operation(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let operation = self
+            .active_repository
+            .as_ref()?
+            .read(cx)
+            .merge
+            .in_progress_operation?;
+        let has_unresolved_conflicts = self.has_unstaged_conflicts();
+        let label = match operation {
+            InProgressOperation::Merge => "Merge in progress",
+            InProgressOperation::Rebase => "Rebase in progress",
+            InProgressOperation::CherryPick => "Cherry-pick in progress",
+            InProgressOperation::Revert => "Revert in progress",
+        };
+
+        Some(
+            h_flex()
+                .px_2()
+                .py_1()
+                .gap_1()
+                .justify_between()
+                .border_t_1()
+                .border_color(cx.theme().status().warning_border)
+                .bg(cx.theme().status().warning_background.opacity(0.5))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Icon::new(IconName::Warning)
+                                .size(IconSize::XSmall)
+                                .color(Color::Warning),
+                        )
+                        .child(Label::new(label).size(LabelSize::Small)),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("abort-operation", "Abort")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.resolve_in_progress_operation(
+                                        InProgressOperationAction::Abort,
+                                        cx,
+                                    )
+                                })),
+                        )
+                        .when(operation != InProgressOperation::Merge, |this| {
+                            this.child(
+                                Button::new("skip-operation", "Skip")
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.resolve_in_progress_operation(
+                                            InProgressOperationAction::Skip,
+                                            cx,
+                                        )
+                                    })),
+                            )
+                        })
+                        .child(
+                            Button::new("continue-operation", "Continue")
+                                .label_size(LabelSize::Small)
+                                .style(ButtonStyle::Filled)
+                                .disabled(has_unresolved_conflicts)
+                                .when(has_unresolved_conflicts, |this| {
+                                    this.tooltip(Tooltip::text(
+                                        "Resolve and stage all conflicts first",
+                                    ))
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.resolve_in_progress_operation(
+                                        InProgressOperationAction::Continue,
+                                        cx,
+                                    )
+                                })),
+                        ),
+                ),
+        )
+    }
+
+    pub fn continue_operation(
+        &mut self,
+        _: &git::ContinueOperation,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resolve_in_progress_operation(InProgressOperationAction::Continue, cx);
+    }
+
+    pub fn abort_operation(
+        &mut self,
+        _: &git::AbortOperation,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resolve_in_progress_operation(InProgressOperationAction::Abort, cx);
+    }
+
+    pub fn skip_operation(
+        &mut self,
+        _: &git::SkipOperation,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resolve_in_progress_operation(InProgressOperationAction::Skip, cx);
+    }
+
+    fn resolve_in_progress_operation(
+        &mut self,
+        action: InProgressOperationAction,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.active_repository.clone() else {
+            return;
+        };
+        let Some(operation) = repository.read(cx).merge.in_progress_operation else {
+            return;
+        };
+        let receiver = repository.update(cx, |repository, cx| {
+            repository.resolve_in_progress_operation(operation, action, cx)
+        });
+        report_git_operation(
+            self.workspace.clone(),
+            format!("{} {}", operation.subcommand(), action.flag()),
+            async move { receiver.await? },
+            cx,
+        );
     }
 
     fn render_pending_amend(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -8989,6 +9121,9 @@ impl Render for GitPanel {
                     .on_action(cx.listener(Self::stash_tracked))
                     .on_action(cx.listener(Self::stash_staged))
                     .on_action(cx.listener(Self::stash_pop))
+                    .on_action(cx.listener(Self::continue_operation))
+                    .on_action(cx.listener(Self::abort_operation))
+                    .on_action(cx.listener(Self::skip_operation))
             })
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::collapse_selected_entry))

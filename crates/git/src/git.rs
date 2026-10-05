@@ -97,6 +97,16 @@ actions!(
         TrashUntrackedFiles,
         /// Undoes the last commit, keeping changes in the working directory.
         Uncommit,
+        /// Merges a branch chosen from the branch picker into the current branch.
+        MergeBranch,
+        /// Rebases the current branch onto a branch chosen from the branch picker.
+        RebaseOntoBranch,
+        /// Continues the in-progress merge, rebase, cherry-pick, or revert.
+        ContinueOperation,
+        /// Aborts the in-progress merge, rebase, cherry-pick, or revert.
+        AbortOperation,
+        /// Skips the current commit of the in-progress rebase, cherry-pick, or revert.
+        SkipOperation,
         /// Pushes commits to the remote repository.
         Push,
         /// Pushes commits to a specific remote branch.

@@ -530,6 +530,15 @@ impl Server {
             .add_request_handler(disallow_guest_request::<proto::GitRemoveWorktree>)
             .add_request_handler(disallow_guest_request::<proto::GitRenameWorktree>)
             .add_request_handler(forward_mutating_project_request::<proto::GitEditRef>)
+            .add_request_handler(forward_mutating_project_request::<proto::GitCherryPick>)
+            .add_request_handler(forward_mutating_project_request::<proto::GitRevert>)
+            .add_request_handler(forward_mutating_project_request::<proto::GitCheckoutCommit>)
+            .add_request_handler(forward_mutating_project_request::<proto::GitCreateTag>)
+            .add_request_handler(forward_mutating_project_request::<proto::GitMerge>)
+            .add_request_handler(forward_mutating_project_request::<proto::GitRebase>)
+            .add_request_handler(
+                forward_mutating_project_request::<proto::GitResolveInProgressOperation>,
+            )
             .add_request_handler(forward_mutating_project_request::<proto::GitRepairWorktrees>)
             .add_request_handler(disallow_guest_request::<proto::GitCreateArchiveCheckpoint>)
             .add_request_handler(disallow_guest_request::<proto::GitRestoreArchiveCheckpoint>)

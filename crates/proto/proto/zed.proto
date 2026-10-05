@@ -522,7 +522,14 @@ message Envelope {
     LanguageServerShowDocumentRequest language_server_show_document_request = 490;
     ExecuteLspCommand execute_lsp_command = 491;
     ExecuteLspCommandResponse execute_lsp_command_response = 492;
-    RefreshDocumentHighlights refresh_document_highlights = 493; // current max
+    RefreshDocumentHighlights refresh_document_highlights = 493;
+    GitCherryPick git_cherry_pick = 494;
+    GitRevert git_revert = 495;
+    GitCheckoutCommit git_checkout_commit = 496;
+    GitCreateTag git_create_tag = 497;
+    GitMerge git_merge = 498;
+    GitRebase git_rebase = 499;
+    GitResolveInProgressOperation git_resolve_in_progress_operation = 500; // current max
   }
 
   reserved 87 to 88;

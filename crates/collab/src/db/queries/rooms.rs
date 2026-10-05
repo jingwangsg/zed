@@ -799,6 +799,7 @@ impl Database {
                             scan_id: db_repository.scan_id as u64,
                             is_last_update: true,
                             merge_message: db_repository.merge_message,
+                            in_progress_operation: None,
                             stash_entries: Vec::new(),
                             remote_upstream_url: db_repository.remote_upstream_url.clone(),
                             remote_origin_url: db_repository.remote_origin_url.clone(),
