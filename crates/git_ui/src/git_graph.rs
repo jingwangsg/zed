@@ -11,14 +11,16 @@ use file_icons::FileIcons;
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
-    repository::{InitialGraphCommitData, LogOrder, LogSource, RepoPath, SearchCommitArgs},
+    repository::{
+        FileRevisionStats, InitialGraphCommitData, LogOrder, LogSource, RepoPath, SearchCommitArgs,
+    },
     status::{FileStatus, StatusCode, TrackedStatus},
 };
 use gpui::{
     Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength,
     DismissEvent, DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable,
-    Hsla, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, ScrollHandle, ScrollStrategy,
-    ScrollWheelEvent, SharedString, Subscription, Task, TextStyleRefinement,
+    Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, PathBuilder, Pixels, Point, ScrollHandle,
+    ScrollStrategy, ScrollWheelEvent, SharedString, Subscription, Task, TextStyleRefinement,
     UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, point, prelude::*,
     px, uniform_list,
 };
@@ -75,6 +77,9 @@ const COPIED_STATE_DURATION: Duration = Duration::from_secs(2);
 const COMMIT_TAG_LIST_WIDTH_IN_REMS: Rems = rems(10.);
 const TREE_INDENT: f32 = 20.0;
 const TABLE_COLUMN_COUNT: usize = 4;
+const TIMELINE_HEIGHT: Pixels = px(72.0);
+const TIMELINE_PADDING: Pixels = px(14.0);
+const TIMELINE_MAX_LANES: usize = 5;
 const ROW_VERTICAL_PADDING: Pixels = px(4.0);
 
 struct CopiedState {
@@ -592,6 +597,8 @@ actions!(
         ScrollDown,
         /// Toggles the selected commit's changed files between flat and tree views.
         ToggleChangedFilesView,
+        /// Toggles the timeline above a file's history.
+        ToggleTimeline,
     ]
 );
 
@@ -1511,13 +1518,11 @@ fn to_row_center(
     bounds.origin.y + to_row as f32 * row_height + row_height / 2.0 - scroll_offset
 }
 
-fn draw_commit_circle(center_x: Pixels, center_y: Pixels, color: Hsla, window: &mut Window) {
-    let radius = COMMIT_CIRCLE_RADIUS;
-
+fn draw_circle(center: Point<Pixels>, radius: Pixels, color: Hsla, window: &mut Window) {
     let mut builder = PathBuilder::fill();
 
     // Start at the rightmost point of the circle
-    builder.move_to(point(center_x + radius, center_y));
+    builder.move_to(point(center.x + radius, center.y));
 
     // Draw the circle using two arc_to calls (top half, then bottom half)
     builder.arc_to(
@@ -1525,19 +1530,128 @@ fn draw_commit_circle(center_x: Pixels, center_y: Pixels, color: Hsla, window: &
         px(0.),
         false,
         true,
-        point(center_x - radius, center_y),
+        point(center.x - radius, center.y),
     );
     builder.arc_to(
         point(radius, radius),
         px(0.),
         false,
         true,
-        point(center_x + radius, center_y),
+        point(center.x + radius, center.y),
     );
     builder.close();
 
     if let Ok(path) = builder.build() {
         window.paint_path(path, color);
+    }
+}
+
+struct TimelinePoint {
+    commit_index: usize,
+    timestamp: i64,
+    lines_changed: u32,
+    lane: usize,
+}
+
+/// A file's history as one dot per commit: time runs left to right, each row is an
+/// author (the most frequent authors get their own row, the rest share the last one),
+/// and the dot grows with the number of changed lines.
+struct TimelineLayout {
+    points: Vec<TimelinePoint>,
+    lane_count: usize,
+    first_timestamp: i64,
+    last_timestamp: i64,
+}
+
+impl TimelineLayout {
+    fn new(commits: &[Rc<CommitEntry>], stats: &[FileRevisionStats]) -> Option<Self> {
+        let stats_by_sha: HashMap<Oid, &FileRevisionStats> =
+            stats.iter().map(|stats| (stats.sha, stats)).collect();
+        let mut commits_by_author: HashMap<&SharedString, usize> = HashMap::default();
+        let mut entries = Vec::new();
+        for (commit_index, commit) in commits.iter().enumerate() {
+            let Some(stats) = stats_by_sha.get(&commit.data.sha) else {
+                continue;
+            };
+            *commits_by_author.entry(&stats.author_email).or_default() += 1;
+            entries.push((commit_index, *stats));
+        }
+        let first_timestamp = entries
+            .iter()
+            .map(|(_, stats)| stats.commit_timestamp)
+            .min()?;
+        let last_timestamp = entries
+            .iter()
+            .map(|(_, stats)| stats.commit_timestamp)
+            .max()?;
+
+        let mut authors: Vec<_> = commits_by_author.into_iter().collect();
+        // The map iterates in arbitrary order, so ties need a fixed order or lanes
+        // would reshuffle between renders.
+        authors.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        let lane_count = authors.len().min(TIMELINE_MAX_LANES);
+        let lane_by_author: HashMap<&SharedString, usize> = authors
+            .iter()
+            .enumerate()
+            .map(|(rank, (email, _))| (*email, rank.min(TIMELINE_MAX_LANES - 1)))
+            .collect();
+
+        let points = entries
+            .into_iter()
+            .map(|(commit_index, stats)| TimelinePoint {
+                commit_index,
+                timestamp: stats.commit_timestamp,
+                lines_changed: stats.additions + stats.deletions,
+                lane: lane_by_author
+                    .get(&stats.author_email)
+                    .copied()
+                    .unwrap_or_default(),
+            })
+            .collect();
+        Some(Self {
+            points,
+            lane_count,
+            first_timestamp,
+            last_timestamp,
+        })
+    }
+
+    fn lane_y(&self, lane: usize, bounds: Bounds<Pixels>) -> Pixels {
+        let usable_height = bounds.size.height - TIMELINE_PADDING * 2.0;
+        bounds.origin.y
+            + TIMELINE_PADDING
+            + usable_height * ((lane as f32 + 0.5) / self.lane_count as f32)
+    }
+
+    fn bubble(&self, dot: &TimelinePoint, bounds: Bounds<Pixels>) -> (Point<Pixels>, Pixels) {
+        let usable_width = bounds.size.width - TIMELINE_PADDING * 2.0;
+        let fraction = if self.last_timestamp > self.first_timestamp {
+            (dot.timestamp - self.first_timestamp) as f32
+                / (self.last_timestamp - self.first_timestamp) as f32
+        } else {
+            0.5
+        };
+        let center = point(
+            bounds.origin.x + TIMELINE_PADDING + usable_width * fraction,
+            self.lane_y(dot.lane, bounds),
+        );
+        let radius = px((3.0 + (dot.lines_changed as f32).sqrt() * 0.75).min(11.0));
+        (center, radius)
+    }
+
+    fn hit_test(&self, position: Point<Pixels>, bounds: Bounds<Pixels>) -> Option<usize> {
+        self.points
+            .iter()
+            .filter_map(|dot| {
+                let (center, radius) = self.bubble(dot, bounds);
+                let distance_x = (position.x - center.x).abs();
+                let distance_y = (position.y - center.y).abs();
+                let reach = radius + px(3.0);
+                (distance_x <= reach && distance_y <= reach)
+                    .then_some((distance_x + distance_y, dot.commit_index))
+            })
+            .min_by_key(|(distance, _)| *distance)
+            .map(|(_, commit_index)| commit_index)
     }
 }
 
@@ -1599,6 +1713,11 @@ pub struct GitGraph {
     changed_files_expanded_dirs: HashMap<RepoPath, bool>,
     pending_select_sha: Option<Oid>,
     nav_history: Option<ItemNavHistory>,
+    timeline_visible: bool,
+    timeline_stats: Option<Vec<FileRevisionStats>>,
+    timeline_task: Option<Task<()>>,
+    timeline_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    hovered_timeline_index: Option<usize>,
 }
 
 impl GitGraph {
@@ -1608,6 +1727,9 @@ impl GitGraph {
         self.search_state.selected_index = None;
         self.search_state.state.next_state();
         self.context_menu = None;
+        self.timeline_stats = None;
+        self.timeline_task = None;
+        self.hovered_timeline_index = None;
         cx.emit(ItemEvent::Edit);
         cx.notify();
     }
@@ -1846,6 +1968,11 @@ impl GitGraph {
             changed_files_expanded_dirs: HashMap::default(),
             pending_select_sha: None,
             nav_history: None,
+            timeline_visible: true,
+            timeline_stats: None,
+            timeline_task: None,
+            timeline_bounds: Rc::default(),
+            hovered_timeline_index: None,
         };
 
         this.fetch_initial_graph_data(cx);
@@ -1945,6 +2072,162 @@ impl GitGraph {
             RepositoryEvent::GraphEvent(_, _) => {}
             _ => {}
         }
+    }
+
+    fn history_path(&self) -> Option<&RepoPath> {
+        match &self.log_source {
+            LogSource::Path(path) | LogSource::Lines { path, .. } => Some(path),
+            LogSource::All | LogSource::Branch(_) | LogSource::Sha(_) => None,
+        }
+    }
+
+    fn ensure_timeline_loaded(&mut self, cx: &mut Context<Self>) {
+        if !self.timeline_visible || self.timeline_stats.is_some() || self.timeline_task.is_some() {
+            return;
+        }
+        let Some(path) = self.history_path().cloned() else {
+            return;
+        };
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let receiver = repository.update(cx, |repository, _| repository.file_history_stats(path));
+        self.timeline_task = Some(cx.spawn(async move |this, cx| {
+            let stats = receiver
+                .await
+                .ok()
+                .and_then(|stats| stats.log_err())
+                .unwrap_or_default();
+            this.update(cx, |this, cx| {
+                this.timeline_stats = Some(stats);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn timeline_layout(&self) -> Option<TimelineLayout> {
+        TimelineLayout::new(&self.graph_data.commits, self.timeline_stats.as_deref()?)
+    }
+
+    fn timeline_hit_test(&self, position: Point<Pixels>) -> Option<usize> {
+        let bounds = self.timeline_bounds.get()?;
+        self.timeline_layout()?.hit_test(position, bounds)
+    }
+
+    fn toggle_timeline(
+        &mut self,
+        _: &ToggleTimeline,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.timeline_visible = !self.timeline_visible;
+        cx.notify();
+    }
+
+    fn render_timeline(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.history_path().is_none() || !self.timeline_visible {
+            return None;
+        }
+        self.ensure_timeline_loaded(cx);
+        let layout = self.timeline_layout();
+        let (first_timestamp, last_timestamp) = layout
+            .as_ref()
+            .map(|layout| (layout.first_timestamp, layout.last_timestamp))
+            .unzip();
+        let selected_entry_idx = self.selected_entry_idx;
+        let hovered_index = self.hovered_timeline_index;
+        let timeline_bounds = self.timeline_bounds.clone();
+        let canvas = layout.map(|layout| {
+            gpui::canvas(
+                move |_bounds, _window, _cx| {},
+                move |bounds: Bounds<Pixels>, _: (), window: &mut Window, cx: &mut App| {
+                    timeline_bounds.set(Some(bounds));
+                    let accent_colors = cx.theme().accents();
+                    let lane_color = cx.theme().colors().border_variant;
+                    let ring_color = cx.theme().colors().text;
+                    for lane in 0..layout.lane_count {
+                        let lane_bounds = Bounds::new(
+                            point(
+                                bounds.origin.x + TIMELINE_PADDING,
+                                layout.lane_y(lane, bounds),
+                            ),
+                            gpui::Size {
+                                width: bounds.size.width - TIMELINE_PADDING * 2.0,
+                                height: px(1.0),
+                            },
+                        );
+                        window.paint_quad(gpui::fill(lane_bounds, lane_color));
+                    }
+                    for dot in &layout.points {
+                        let (center, radius) = layout.bubble(dot, bounds);
+                        if selected_entry_idx == Some(dot.commit_index) {
+                            draw_circle(center, radius + px(2.5), ring_color, window);
+                        }
+                        let radius = if hovered_index == Some(dot.commit_index) {
+                            radius + px(1.5)
+                        } else {
+                            radius
+                        };
+                        let color = accent_colors.color_for_index(dot.lane as u32);
+                        draw_circle(center, radius, color, window);
+                    }
+                },
+            )
+            .size_full()
+        });
+
+        // The strip keeps its height while the stats load, so the commit list below
+        // does not jump once they arrive.
+        Some(
+            v_flex()
+                .w_full()
+                .border_b_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    h_flex()
+                        .h_5()
+                        .px_2()
+                        .justify_between()
+                        .children(first_timestamp.map(|timestamp| {
+                            Label::new(format_timestamp(timestamp))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                        }))
+                        .children(last_timestamp.map(|timestamp| {
+                            Label::new(format_timestamp(timestamp))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                        })),
+                )
+                .child(
+                    div()
+                        .id("git-graph-timeline")
+                        .h(TIMELINE_HEIGHT)
+                        .w_full()
+                        .cursor_pointer()
+                        .children(canvas)
+                        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                            let hovered = this.timeline_hit_test(event.position);
+                            if hovered != this.hovered_timeline_index {
+                                this.hovered_timeline_index = hovered;
+                                cx.notify();
+                            }
+                        }))
+                        .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                            if let Some(index) = this.timeline_hit_test(event.position()) {
+                                this.select_entry(index, ScrollStrategy::Center, cx);
+                            }
+                        }))
+                        .on_hover(cx.listener(|this, &hovered: &bool, _, cx| {
+                            if !hovered && this.hovered_timeline_index.is_some() {
+                                this.hovered_timeline_index = None;
+                                cx.notify();
+                            }
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     fn fetch_initial_graph_data(&mut self, cx: &mut App) {
@@ -2701,10 +2984,7 @@ impl GitGraph {
         let repository = self
             .get_repository(cx)
             .map(|repository| repository.downgrade());
-        let history_path = match &self.log_source {
-            LogSource::Path(path) | LogSource::Lines { path, .. } => Some(path.clone()),
-            LogSource::All | LogSource::Branch(_) | LogSource::Sha(_) => None,
-        };
+        let history_path = self.history_path().cloned();
         let context_menu = commit_context_menu(
             CommitContextMenuData {
                 sha: commit.data.sha,
@@ -2852,6 +3132,19 @@ impl GitGraph {
                     .bg(color.toolbar_background)
                     .on_action(cx.listener(Self::confirm_search))
                     .child(self.search_state.editor.clone())
+                    .when(self.log_source.is_path_history(), |this| {
+                        this.child(
+                            IconButton::new("git-graph-toggle-timeline", IconName::Clock)
+                                .shape(ui::IconButtonShape::Square)
+                                .toggle_state(self.timeline_visible)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_timeline(&ToggleTimeline, window, cx)
+                                }))
+                                .tooltip(|_window, cx| {
+                                    Tooltip::for_action("Toggle Timeline", &ToggleTimeline, cx)
+                                }),
+                        )
+                    })
                     .child({
                         let focus_handle = query_focus_handle.clone();
                         IconButton::new("git-graph-search-case-sensitive", IconName::CaseSensitive)
@@ -3547,7 +3840,12 @@ impl GitGraph {
 
                         let commit_x = lane_center_x(bounds, row.lane as f32);
 
-                        draw_commit_circle(commit_x, row_y_center, row_color, window);
+                        draw_circle(
+                            point(commit_x, row_y_center),
+                            COMMIT_CIRCLE_RADIUS,
+                            row_color,
+                            window,
+                        );
                     }
 
                     for line in commit_lines {
@@ -4341,6 +4639,7 @@ impl Render for GitGraph {
             .on_action(cx.listener(Self::scroll_down))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::toggle_changed_files_view))
+            .on_action(cx.listener(Self::toggle_timeline))
             .on_action(cx.listener(Self::focus_next_tab_stop))
             .on_action(cx.listener(Self::focus_previous_tab_stop))
             .on_action(cx.listener(|this, _: &SelectNextMatch, _window, cx| {
@@ -4359,6 +4658,7 @@ impl Render for GitGraph {
                 v_flex()
                     .size_full()
                     .child(self.render_search_bar(cx))
+                    .children(self.render_timeline(cx))
                     .child(div().flex_1().child(content)),
             )
             .children(self.context_menu.as_ref().map(|context_menu| {
@@ -5051,6 +5351,95 @@ mod tests {
     use smallvec::{SmallVec, smallvec};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+
+    fn timeline_commit(sha: Oid) -> Rc<CommitEntry> {
+        Rc::new(CommitEntry {
+            data: Arc::new(InitialGraphCommitData {
+                sha,
+                parents: SmallVec::new(),
+                ref_names: Vec::new(),
+            }),
+            lane: 0,
+            color_idx: 0,
+        })
+    }
+
+    fn timeline_stats(sha: Oid, author_email: &str, commit_timestamp: i64) -> FileRevisionStats {
+        FileRevisionStats {
+            sha,
+            commit_timestamp,
+            author_email: author_email.to_string().into(),
+            additions: 1,
+            deletions: 0,
+        }
+    }
+
+    #[test]
+    fn test_timeline_layout_assigns_lanes_by_author_frequency() {
+        let shas: Vec<Oid> = (0..9)
+            .map(|index| Oid::from_bytes(&[index as u8; 20]).unwrap())
+            .collect();
+        let commits: Vec<_> = shas.iter().map(|sha| timeline_commit(*sha)).collect();
+        // Six authors: `most` has three commits, `second` two, the rest one each.
+        let authors = [
+            "most", "most", "most", "second", "second", "c", "d", "e", "f",
+        ];
+        let mut stats: Vec<_> = shas
+            .iter()
+            .zip(authors)
+            .enumerate()
+            .map(|(index, (sha, author))| timeline_stats(*sha, author, 1_000 + index as i64))
+            .collect();
+        // Stats for a commit that is not in the graph are ignored.
+        stats.push(timeline_stats(
+            Oid::from_bytes(&[0xff; 20]).unwrap(),
+            "stranger",
+            5_000,
+        ));
+
+        let layout = TimelineLayout::new(&commits, &stats).unwrap();
+        assert_eq!(layout.points.len(), 9);
+        assert_eq!(layout.lane_count, TIMELINE_MAX_LANES);
+        assert_eq!(
+            (layout.first_timestamp, layout.last_timestamp),
+            (1_000, 1_008)
+        );
+        let lane_of = |index: usize| {
+            layout
+                .points
+                .iter()
+                .find(|dot| dot.commit_index == index)
+                .unwrap()
+                .lane
+        };
+        assert_eq!(lane_of(0), 0, "most frequent author gets the first lane");
+        assert_eq!(lane_of(3), 1);
+        // Single-commit authors tie and are ordered by email; `e` takes the last
+        // lane and `f`, past the lane limit, shares it.
+        assert_eq!((lane_of(5), lane_of(6), lane_of(7)), (2, 3, 4));
+        assert_eq!(lane_of(8), TIMELINE_MAX_LANES - 1);
+
+        let bounds = Bounds::new(
+            point(px(0.), px(0.)),
+            gpui::Size {
+                width: px(228.),
+                height: px(100.),
+            },
+        );
+        let (first, _) = layout.bubble(&layout.points[0], bounds);
+        let (last, _) = layout.bubble(&layout.points[8], bounds);
+        assert_eq!(first.x, TIMELINE_PADDING);
+        assert_eq!(last.x, px(228.) - TIMELINE_PADDING);
+        assert_eq!(layout.hit_test(first, bounds), Some(0));
+        assert_eq!(layout.hit_test(point(px(114.), px(-50.)), bounds), None);
+
+        // A single commit sits in the middle of the strip.
+        let single = TimelineLayout::new(&commits[..1], &stats[..1]).unwrap();
+        let (center, _) = single.bubble(&single.points[0], bounds);
+        assert_eq!(center.x, px(114.));
+
+        assert!(TimelineLayout::new(&commits, &[]).is_none());
+    }
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {

@@ -55,6 +55,7 @@ static GRAPH_COMMIT_FORMAT: &str = "--format=%H%x00%P%x00%D";
 /// Used to get commits that match with a search
 /// %H - Full commit hash
 static SEARCH_COMMIT_FORMAT: &str = "--format=%H";
+static FILE_HISTORY_STATS_FORMAT: &str = "--format=%x1e%H%x00%at%x00%ae";
 
 /// Number of commits to load per chunk for the git graph.
 pub const GRAPH_CHUNK_SIZE: usize = 1000;
@@ -906,6 +907,16 @@ pub struct FileRevisionNeighbors {
     pub next: Option<Oid>,
 }
 
+/// One commit's change to a file, for drawing the file's history as a timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRevisionStats {
+    pub sha: Oid,
+    pub commit_timestamp: i64,
+    pub author_email: SharedString,
+    pub additions: u32,
+    pub deletions: u32,
+}
+
 pub fn commit_hash_search_query(query: &str) -> Option<&str> {
     let query = query.trim();
     (SHORT_SHA_LENGTH..=SHA256_HEX_LENGTH)
@@ -1322,6 +1333,9 @@ pub trait GitRepository: Send + Sync {
         path: RepoPath,
         revision: Oid,
     ) -> BoxFuture<'_, Result<FileRevisionNeighbors>>;
+
+    /// Every commit that changed the file, newest first, with the lines it changed.
+    fn file_history_stats(&self, path: RepoPath) -> BoxFuture<'_, Result<Vec<FileRevisionStats>>>;
 
     fn update_ref(&self, ref_name: String, commit: String) -> BoxFuture<'_, Result<()>>;
 
@@ -3222,6 +3236,54 @@ impl GitRepository for RealGitRepository {
                     previous: previous.lines().next().map(Oid::from_str).transpose()?,
                     next: later.lines().last().map(Oid::from_str).transpose()?,
                 })
+            })
+            .boxed()
+    }
+
+    fn file_history_stats(&self, path: RepoPath) -> BoxFuture<'_, Result<Vec<FileRevisionStats>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let output = git
+                    .run(&[
+                        "log",
+                        FILE_HISTORY_STATS_FORMAT,
+                        "--numstat",
+                        "--follow",
+                        "--",
+                        path.as_unix_str(),
+                    ])
+                    .await?;
+                // Each record starts with the separator, so the chunk before the first
+                // one is empty and has no header line to parse.
+                Ok(output
+                    .split('\x1e')
+                    .filter_map(|record| {
+                        let mut lines = record.lines();
+                        let mut header = lines.next()?.split('\0');
+                        let sha = Oid::from_str(header.next()?).ok()?;
+                        let commit_timestamp = header.next()?.parse().ok()?;
+                        let author_email = SharedString::from(header.next()?.to_string());
+                        // Binary changes list `-` in both columns and count as no lines.
+                        let (additions, deletions) = lines
+                            .filter_map(|line| {
+                                let mut columns = line.split('\t');
+                                let additions = columns.next()?.parse::<u32>().unwrap_or(0);
+                                let deletions = columns.next()?.parse::<u32>().unwrap_or(0);
+                                Some((additions, deletions))
+                            })
+                            .fold((0, 0), |(added, deleted), (additions, deletions)| {
+                                (added + additions, deleted + deletions)
+                            });
+                        Some(FileRevisionStats {
+                            sha,
+                            commit_timestamp,
+                            author_email,
+                            additions,
+                            deletions,
+                        })
+                    })
+                    .collect())
             })
             .boxed()
     }
@@ -5330,6 +5392,67 @@ mod tests {
                 next: Some(shas[1]),
             }
         );
+    }
+
+    #[gpui::test]
+    async fn test_file_history_stats(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let path = repo_dir.path();
+        git_init_repo(path);
+        fs::write(path.join("a.txt"), "one\ntwo\n").unwrap();
+        git_command(path, ["add", "a.txt"]);
+        git_command(
+            path,
+            ["commit", "-m", "add", "--author=Alice <alice@example.com>"],
+        );
+        let first: Oid = git_command_output(path, ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+        fs::write(path.join("a.txt"), "one\nthree\nfour\n").unwrap();
+        git_command(
+            path,
+            ["commit", "-am", "edit", "--author=Bob <bob@example.com>"],
+        );
+        let second: Oid = git_command_output(path, ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+        fs::write(path.join("a.txt"), [0u8, 159, 146, 150]).unwrap();
+        git_command(path, ["commit", "-am", "binary"]);
+        let third: Oid = git_command_output(path, ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+
+        let stats = repository
+            .file_history_stats(RepoPath::new("a.txt").unwrap())
+            .await
+            .unwrap();
+        let summary: Vec<_> = stats
+            .iter()
+            .map(|stats| {
+                (
+                    stats.sha,
+                    stats.author_email.as_ref(),
+                    stats.additions,
+                    stats.deletions,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (third, "test@zed.dev", 0, 0),
+                (second, "bob@example.com", 2, 1),
+                (first, "alice@example.com", 2, 0),
+            ]
+        );
+        assert!(stats.iter().all(|stats| stats.commit_timestamp > 0));
     }
 
     #[gpui::test]

@@ -135,6 +135,10 @@ Line History narrows the list to the commits that changed the selected lines, us
 
 The Git Graph shows the commit history of the repository with branch and tag labels. Open it from the Git Panel or with the Command Palette.
 
+### Timeline
+
+File History and Line History show a timeline above the commit list. Each dot is a commit, placed by date from left to right and sized by the number of lines it changed in the file. Each row is an author, with the most frequent authors first; up to five rows are shown, and less frequent authors share the last row. Click a dot to select the commit. {#action git_graph::ToggleTimeline} hides or shows the timeline.
+
 ### Searching Commits
 
 The search box in the Git Graph matches commit messages and commit hashes. Add filters to narrow the results:

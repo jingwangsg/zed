@@ -740,6 +740,24 @@ message GitFileRevisionNeighborsResponse {
   optional string next = 2;
 }
 
+message GitFileHistoryStats {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string path = 3;
+}
+
+message GitFileHistoryStatsResponse {
+  repeated GitFileRevisionStats entries = 1;
+}
+
+message GitFileRevisionStats {
+  string sha = 1;
+  int64 commit_timestamp = 2;
+  string author_email = 3;
+  uint32 additions = 4;
+  uint32 deletions = 5;
+}
+
 message GitEditRef {
   uint64 project_id = 1;
   uint64 repository_id = 2;

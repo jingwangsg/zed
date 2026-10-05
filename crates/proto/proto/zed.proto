@@ -535,7 +535,9 @@ message Envelope {
     GitContributors git_contributors = 503;
     GitContributorsResponse git_contributors_response = 504;
     GitFileRevisionNeighbors git_file_revision_neighbors = 505;
-    GitFileRevisionNeighborsResponse git_file_revision_neighbors_response = 506; // current max
+    GitFileRevisionNeighborsResponse git_file_revision_neighbors_response = 506;
+    GitFileHistoryStats git_file_history_stats = 507;
+    GitFileHistoryStatsResponse git_file_history_stats_response = 508; // current max
   }
 
   reserved 87 to 88;

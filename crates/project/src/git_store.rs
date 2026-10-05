@@ -38,8 +38,8 @@ use git::{
     repository::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
         Contributor, CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions,
-        FileHistoryChangedFileSets, FileRevisionNeighbors, GitCommitTemplate, GitRepository,
-        GitRepositoryCheckpoint, InProgressOperation, InProgressOperationAction,
+        FileHistoryChangedFileSets, FileRevisionNeighbors, FileRevisionStats, GitCommitTemplate,
+        GitRepository, GitRepositoryCheckpoint, InProgressOperation, InProgressOperationAction,
         InitialGraphCommitData, LogOrder, LogSource, MergeKind, PushOptions, Remote,
         RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus,
         Worktree as GitWorktree, delete_branch_flag, is_binary_content,
@@ -1103,6 +1103,7 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_revparse);
         client.add_entity_request_handler(Self::handle_contributors);
         client.add_entity_request_handler(Self::handle_file_revision_neighbors);
+        client.add_entity_request_handler(Self::handle_file_history_stats);
         client.add_entity_request_handler(Self::handle_edit_ref);
         client.add_entity_request_handler(Self::handle_repair_worktrees);
         client.add_entity_request_handler(Self::handle_get_commit_data);
@@ -4050,6 +4051,33 @@ impl GitStore {
         Ok(proto::GitFileRevisionNeighborsResponse {
             previous: neighbors.previous.map(|sha| sha.to_string()),
             next: neighbors.next.map(|sha| sha.to_string()),
+        })
+    }
+
+    async fn handle_file_history_stats(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitFileHistoryStats>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitFileHistoryStatsResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let path = RepoPath::from_proto(&envelope.payload.path)?;
+        let entries = repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.file_history_stats(path)
+            })
+            .await??;
+        Ok(proto::GitFileHistoryStatsResponse {
+            entries: entries
+                .into_iter()
+                .map(|stats| proto::GitFileRevisionStats {
+                    sha: stats.sha.to_string(),
+                    commit_timestamp: stats.commit_timestamp,
+                    author_email: stats.author_email.to_string(),
+                    additions: stats.additions,
+                    deletions: stats.deletions,
+                })
+                .collect(),
         })
     }
 
@@ -9648,6 +9676,42 @@ impl Repository {
                 }
             },
         )
+    }
+
+    pub fn file_history_stats(
+        &mut self,
+        path: RepoPath,
+    ) -> oneshot::Receiver<Result<Vec<FileRevisionStats>>> {
+        let id = self.id;
+        self.send_job("file_history_stats", None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.file_history_stats(path).await
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    let response = client
+                        .request(proto::GitFileHistoryStats {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                            path: path.as_unix_str().to_owned(),
+                        })
+                        .await?;
+                    response
+                        .entries
+                        .into_iter()
+                        .map(|entry| {
+                            Ok(FileRevisionStats {
+                                sha: Oid::from_str(&entry.sha)?,
+                                commit_timestamp: entry.commit_timestamp,
+                                author_email: entry.author_email.into(),
+                                additions: entry.additions,
+                                deletions: entry.deletions,
+                            })
+                        })
+                        .collect()
+                }
+            }
+        })
     }
 
     pub fn head_sha(&mut self) -> oneshot::Receiver<Result<Option<String>>> {

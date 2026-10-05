@@ -13,10 +13,10 @@ use git::{
     repository::{
         AskPassDelegate, Branch, CommitData, CommitDataReader, CommitDetails, CommitOptions,
         Contributor, CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets,
-        FileRevisionNeighbors, GRAPH_CHUNK_SIZE, GitRepository, GitRepositoryCheckpoint,
-        InProgressOperation, InProgressOperationAction, InitialGraphCommitData, LogOrder,
-        LogSource, MergeKind, PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs,
-        Worktree, commit_hash_search_query,
+        FileRevisionNeighbors, FileRevisionStats, GRAPH_CHUNK_SIZE, GitRepository,
+        GitRepositoryCheckpoint, InProgressOperation, InProgressOperationAction,
+        InitialGraphCommitData, LogOrder, LogSource, MergeKind, PushOptions, RefEdit, Remote,
+        RepoPath, ResetMode, SearchCommitArgs, Worktree, commit_hash_search_query,
     },
     stash::GitStash,
     status::{
@@ -1780,6 +1780,28 @@ impl GitRepository for FakeGitRepository {
                     .and_then(|index| state.graph_commits.get(index))
                     .map(|commit| commit.sha),
             })
+        })
+    }
+
+    fn file_history_stats(&self, _path: RepoPath) -> BoxFuture<'_, Result<Vec<FileRevisionStats>>> {
+        self.with_state_async(false, |state| {
+            Ok(state
+                .graph_commits
+                .iter()
+                .filter_map(|commit| {
+                    let FakeCommitDataEntry::Success(data) = state.commit_data.get(&commit.sha)?
+                    else {
+                        return None;
+                    };
+                    Some(FileRevisionStats {
+                        sha: commit.sha,
+                        commit_timestamp: data.commit_timestamp,
+                        author_email: data.author_email.clone(),
+                        additions: 0,
+                        deletions: 0,
+                    })
+                })
+                .collect())
         })
     }
 
