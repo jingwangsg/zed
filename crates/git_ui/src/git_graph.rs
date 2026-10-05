@@ -22,9 +22,10 @@ use gpui::{
     UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, point, prelude::*,
     px, uniform_list,
 };
-use language::line_diff;
+use language::{ToPoint as _, line_diff};
 use markdown::{Markdown, MarkdownElement};
 use menu::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrevious};
+use multi_buffer::ToPoint as _;
 use picker::{Picker, PickerDelegate};
 use project::{
     ProjectPath,
@@ -1077,6 +1078,69 @@ pub fn init(cx: &mut App) {
                 },
             )
             .when(
+                active_editor_repository_path(workspace, cx).is_some(),
+                |div| {
+                    let git_store = workspace.project().read(cx).git_store().clone();
+                    let workspace = workspace.weak_handle();
+                    div.on_action(move |_: &git::LineHistory, window, cx| {
+                        let Ok(Some((buffer, selection, repo_id, repo_path))) = workspace
+                            .update(cx, |workspace, cx| line_history_selection(workspace, cx))
+                        else {
+                            return;
+                        };
+                        // `git log -L` counts rows in HEAD's version of the file. The editor's
+                        // own diff may be against the default branch instead (`git.diff_base`),
+                        // so the HEAD diff is opened here explicitly.
+                        let head_diff = git_store.update(cx, |git_store, cx| {
+                            git_store.open_uncommitted_diff(buffer.clone(), cx)
+                        });
+                        let workspace = workspace.clone();
+                        let git_store = git_store.clone();
+                        window
+                            .spawn(cx, async move |cx| {
+                                let Some(head_diff) = head_diff.await.log_err() else {
+                                    return;
+                                };
+                                workspace
+                                    .update_in(cx, |workspace, window, cx| {
+                                        let buffer_snapshot = buffer.read(cx).snapshot();
+                                        let diff_snapshot = head_diff.read(cx).snapshot(cx);
+                                        let start = diff_snapshot.buffer_point_to_base_text_point(
+                                            selection.start.to_point(&buffer_snapshot),
+                                            &buffer_snapshot,
+                                        );
+                                        let end = diff_snapshot.buffer_point_to_base_text_point(
+                                            selection.end.to_point(&buffer_snapshot),
+                                            &buffer_snapshot,
+                                        );
+                                        // A selection that stops at the start of a line does
+                                        // not include that line.
+                                        let end_row = if end.column == 0 && end.row > start.row {
+                                            end.row - 1
+                                        } else {
+                                            end.row
+                                        };
+                                        open_or_reuse_graph(
+                                            workspace,
+                                            repo_id,
+                                            git_store,
+                                            LogSource::Lines {
+                                                path: repo_path,
+                                                start_row: start.row + 1,
+                                                end_row: end_row + 1,
+                                            },
+                                            None,
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                    .ok();
+                            })
+                            .detach();
+                    })
+                },
+            )
+            .when(
                 workspace.project().read(cx).active_repository(cx).is_some(),
                 |div| {
                     let workspace = workspace.weak_handle();
@@ -1170,8 +1234,15 @@ fn resolve_file_history_target(
         return Some((repository.read(cx).id, LogSource::Path(repo_path)));
     }
 
-    let editor = workspace.active_item_as::<Editor>(cx)?;
+    let (_, repository, repo_path) = active_editor_repository_path(workspace, cx)?;
+    Some((repository.read(cx).id, LogSource::Path(repo_path)))
+}
 
+fn active_editor_repository_path(
+    workspace: &Workspace,
+    cx: &App,
+) -> Option<(Entity<Editor>, Entity<Repository>, RepoPath)> {
+    let editor = workspace.active_item_as::<Editor>(cx)?;
     let file = editor
         .read(cx)
         .file_at(editor.read(cx).selections.newest_anchor().head(), cx)?;
@@ -1179,12 +1250,47 @@ fn resolve_file_history_target(
         worktree_id: file.worktree_id(cx),
         path: file.path().clone(),
     };
-
-    let git_store = workspace.project().read(cx).git_store();
-    let (repo, repo_path) = git_store
+    let (repository, repo_path) = workspace
+        .project()
+        .read(cx)
+        .git_store()
         .read(cx)
         .repository_and_path_for_project_path(&project_path, cx)?;
-    Some((repo.read(cx).id, LogSource::Path(repo_path)))
+    Some((editor, repository, repo_path))
+}
+
+/// The active editor's newest selection as anchors in the underlying buffer, clipped to
+/// the excerpt that holds the selection's head when it spans several. Anchors rather
+/// than points, because the caller resolves them after awaiting the HEAD diff.
+fn line_history_selection(
+    workspace: &Workspace,
+    cx: &App,
+) -> Option<(
+    Entity<language::Buffer>,
+    Range<language::Anchor>,
+    RepositoryId,
+    RepoPath,
+)> {
+    let (editor, repository, repo_path) = active_editor_repository_path(workspace, cx)?;
+    let editor = editor.read(cx);
+    let selection = *editor.selections.newest_anchor();
+    let multi_buffer = editor.buffer().read(cx);
+    let snapshot = multi_buffer.snapshot(cx);
+    let buffer_ranges = snapshot.range_to_buffer_ranges(
+        selection.start.to_point(&snapshot)..selection.end.to_point(&snapshot),
+    );
+    // The file was resolved at the selection's head, so take the excerpt that holds it.
+    let (buffer_snapshot, range, _) = if selection.reversed {
+        buffer_ranges.first()
+    } else {
+        buffer_ranges.last()
+    }?;
+    Some((
+        multi_buffer.buffer(buffer_snapshot.remote_id())?,
+        buffer_snapshot.anchor_before(range.start.0)..buffer_snapshot.anchor_before(range.end.0),
+        repository.read(cx).id,
+        repo_path,
+    ))
 }
 
 pub fn open_or_reuse_graph(
@@ -1393,7 +1499,7 @@ impl GitGraph {
             }
         };
 
-        let is_path_history = matches!(self.log_source, LogSource::Path(_));
+        let is_path_history = self.log_source.is_path_history();
         let graph_fraction = if is_path_history { 0.0 } else { value(0) };
         let offset = if is_path_history { 0 } else { 1 };
 
@@ -1470,7 +1576,7 @@ impl GitGraph {
 
         let search_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Search commits…", window, cx);
+            editor.set_placeholder_text("Search commits (author:, file:, change:)…", window, cx);
             editor
         });
 
@@ -1480,7 +1586,7 @@ impl GitGraph {
             state
         });
 
-        let column_widths = if matches!(log_source, LogSource::Path(_)) {
+        let column_widths = if log_source.is_path_history() {
             cx.new(|_cx| {
                 RedistributableColumnsState::new(
                     4,
@@ -1521,7 +1627,7 @@ impl GitGraph {
         };
         let column_visibility = TableRow::from_element(
             false,
-            if matches!(log_source, LogSource::Path(_)) {
+            if log_source.is_path_history() {
                 TABLE_COLUMN_COUNT
             } else {
                 TABLE_COLUMN_COUNT + 1
@@ -2036,10 +2142,7 @@ impl GitGraph {
         repo.update(cx, |repo, cx| {
             repo.search_commits(
                 self.log_source.clone(),
-                SearchCommitArgs {
-                    query: query.clone(),
-                    case_sensitive: self.search_state.case_sensitive,
-                },
+                SearchCommitArgs::parse(query.as_str(), self.search_state.case_sensitive),
                 request_tx,
                 cx,
             );
@@ -2498,7 +2601,7 @@ impl GitGraph {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let is_path_history = matches!(self.log_source, LogSource::Path(_));
+        let is_path_history = self.log_source.is_path_history();
         let columns: &[&str] = if is_path_history {
             &["Description", "Date", "Author", "Commit"]
         } else {
@@ -3741,7 +3844,7 @@ impl Render for GitGraph {
                     this.child(self.render_loading_spinner(cx))
                 })
         } else {
-            let is_path_history = matches!(self.log_source, LogSource::Path(_));
+            let is_path_history = self.log_source.is_path_history();
             let header_resize_info =
                 HeaderResizeInfo::from_redistributable(&self.column_widths, cx);
 
@@ -4121,20 +4224,28 @@ impl Item for GitGraph {
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
         });
-        let path_history_path = match &self.log_source {
-            LogSource::Path(path) => Some(path.as_unix_str().to_string()),
+        let path_history = match &self.log_source {
+            LogSource::Path(path) => Some(("Path History", path.as_unix_str().to_string())),
+            LogSource::Lines {
+                path,
+                start_row,
+                end_row,
+            } => Some((
+                "Line History",
+                format!("{}:{start_row}-{end_row}", path.as_unix_str()),
+            )),
             _ => None,
         };
 
         Some(TabTooltipContent::Custom(Box::new(Tooltip::element({
             move |_, _| {
                 v_flex()
-                    .child(Label::new(if path_history_path.is_some() {
-                        "Path History"
-                    } else {
-                        "Git Graph"
-                    }))
-                    .when_some(path_history_path.clone(), |this, path| {
+                    .child(Label::new(
+                        path_history
+                            .as_ref()
+                            .map_or("Git Graph", |(title, _)| title),
+                    ))
+                    .when_some(path_history.clone(), |this, (_, path)| {
                         this.child(Label::new(path).color(Color::Muted).size(LabelSize::Small))
                     })
                     .when_some(repo_name.clone(), |this, name| {
@@ -4146,22 +4257,34 @@ impl Item for GitGraph {
     }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
-        if let LogSource::Path(path) = &self.log_source {
-            return path
-                .as_ref()
-                .file_name()
-                .map(|name| SharedString::from(name.to_string()))
-                .unwrap_or_else(|| SharedString::from(path.as_unix_str().to_string()));
+        let (path, rows) = match &self.log_source {
+            LogSource::Path(path) => (path, None),
+            LogSource::Lines {
+                path,
+                start_row,
+                end_row,
+            } => (path, Some((start_row, end_row))),
+            _ => {
+                return self
+                    .get_repository(cx)
+                    .and_then(|repo| {
+                        repo.read(cx)
+                            .work_directory_abs_path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                    })
+                    .map_or_else(|| "Git Graph".into(), |name| SharedString::from(name));
+            }
+        };
+        let file_name = path
+            .as_ref()
+            .file_name()
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| path.as_unix_str().to_string());
+        match rows {
+            Some((start_row, end_row)) => format!("{file_name}:{start_row}-{end_row}").into(),
+            None => file_name.into(),
         }
-
-        self.get_repository(cx)
-            .and_then(|repo| {
-                repo.read(cx)
-                    .work_directory_abs_path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-            })
-            .map_or_else(|| "Git Graph".into(), |name| SharedString::from(name))
     }
 
     fn show_toolbar(&self) -> bool {
@@ -4426,6 +4549,7 @@ mod persistence {
     pub const LOG_SOURCE_BRANCH: i32 = 1;
     pub const LOG_SOURCE_SHA: i32 = 2;
     pub const LOG_SOURCE_PATH: i32 = 3;
+    pub const LOG_SOURCE_LINES: i32 = 4;
 
     pub const LOG_ORDER_DATE: i32 = 0;
     pub const LOG_ORDER_TOPO: i32 = 1;
@@ -4438,6 +4562,7 @@ mod persistence {
             LogSource::Branch(_) => LOG_SOURCE_BRANCH,
             LogSource::Sha(_) => LOG_SOURCE_SHA,
             LogSource::Path(_) => LOG_SOURCE_PATH,
+            LogSource::Lines { .. } => LOG_SOURCE_LINES,
         }
     }
 
@@ -4447,6 +4572,11 @@ mod persistence {
             LogSource::Branch(branch) => Some(branch.to_string()),
             LogSource::Sha(oid) => Some(oid.to_string()),
             LogSource::Path(path) => Some(path.as_unix_str().to_string()),
+            LogSource::Lines {
+                path,
+                start_row,
+                end_row,
+            } => Some(format!("{start_row},{end_row}:{}", path.as_unix_str())),
         }
     }
 
@@ -4478,6 +4608,19 @@ mod persistence {
                 .as_ref()
                 .and_then(|v| RepoPath::new(v).ok())
                 .map(LogSource::Path)
+                .unwrap_or_default(),
+            Some(LOG_SOURCE_LINES) => state
+                .log_source_value
+                .as_ref()
+                .and_then(|value| {
+                    let (rows, path) = value.split_once(':')?;
+                    let (start_row, end_row) = rows.split_once(',')?;
+                    Some(LogSource::Lines {
+                        path: RepoPath::new(path).ok()?,
+                        start_row: start_row.parse().ok()?,
+                        end_row: end_row.parse().ok()?,
+                    })
+                })
                 .unwrap_or_default(),
             None | Some(_) => LogSource::default(),
         }

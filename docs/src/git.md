@@ -119,6 +119,24 @@ To view File History:
 - Right-click on an editor tab and select "View File History"
 - Use the Command Palette and search for "file history"
 
+### Line History
+
+Line History narrows the list to the commits that changed the selected lines, using `git log -L`. Select the lines in the editor, then right-click and choose "View Line History" or run {#action git::LineHistory}. The lines are counted in the committed version of the file, so uncommitted edits above the selection do not shift the range.
+
+## Git Graph
+
+The Git Graph shows the commit history of the repository with branch and tag labels. Open it from the Git Panel or with the Command Palette.
+
+### Searching Commits
+
+The search box in the Git Graph matches commit messages and commit hashes. Add filters to narrow the results:
+
+- `author:<name>` matches the author name or email, for example `author:alice`
+- `file:<path>` keeps commits that touch a path, for example `file:crates/git`
+- `change:<text>` keeps commits that add or remove the text, like `git log -S`
+
+Quote a value that contains spaces, as in `author:"Ada Lovelace"`. Any remaining words are matched against the commit message. The `file:` filter is ignored in File History and Line History, which are already limited to one file, and `change:` has no effect in Line History.
+
 ## Fetch, Push, and Pull
 
 Fetch, push, or pull from your Git repository in Zed via the buttons available on the Git Panel or via the Command Palette by looking at the respective actions: {#action git::Fetch}, {#action git::Push}, and {#action git::Pull}.

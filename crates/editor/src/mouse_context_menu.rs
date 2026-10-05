@@ -325,6 +325,11 @@ pub fn deploy_context_menu(
                     !has_git_repo,
                     "View File History",
                     Box::new(git::FileHistory),
+                )
+                .action_disabled_when(
+                    !has_git_repo,
+                    "View Line History",
+                    Box::new(git::LineHistory),
                 );
             match focus {
                 Some(focus) => builder.context(focus),

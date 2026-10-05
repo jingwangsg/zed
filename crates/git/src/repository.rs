@@ -782,9 +782,23 @@ pub enum LogSource {
     Branch(SharedString),
     Sha(Oid),
     Path(RepoPath),
+    /// The commits that touched a line range of one file, as `git log -L` reports them.
+    /// Rows are 1-based and inclusive, counted in HEAD's version of the file. A tab that
+    /// keeps this source after HEAD moves keeps its row numbers too.
+    Lines {
+        path: RepoPath,
+        start_row: u32,
+        end_row: u32,
+    },
 }
 
 impl LogSource {
+    /// Sources that follow a single file have no meaningful parent graph, since `%P`
+    /// names parents that the filtered log leaves out.
+    pub fn is_path_history(&self) -> bool {
+        matches!(self, LogSource::Path(_) | LogSource::Lines { .. })
+    }
+
     fn get_args(&self) -> Vec<Cow<'_, str>> {
         let mut args = match self {
             LogSource::All => vec![
@@ -801,6 +815,15 @@ impl LogSource {
                 Cow::Borrowed("--"),
                 Cow::Borrowed(path.as_unix_str()),
             ],
+            // `-L` turns on patch output, which would corrupt the `--format` parsers.
+            LogSource::Lines {
+                path,
+                start_row,
+                end_row,
+            } => vec![
+                Cow::Borrowed("--no-patch"),
+                Cow::Owned(format!("-L{start_row},{end_row}:{}", path.as_unix_str())),
+            ],
         };
         // Without a terminator git cannot tell a branch named `docs/rewrite` from a
         // `docs/rewrite` directory in the working tree, and refuses the argument as
@@ -813,8 +836,60 @@ impl LogSource {
 }
 
 pub struct SearchCommitArgs {
+    /// The free text matched against commit messages, or a commit hash prefix.
     pub query: SharedString,
     pub case_sensitive: bool,
+    pub author: Option<String>,
+    pub path: Option<String>,
+    /// Text whose number of occurrences changed in the commit (`git log -S`).
+    pub change: Option<String>,
+}
+
+impl SearchCommitArgs {
+    /// Splits `author:`, `file:`, and `change:` filters out of a search box query. A filter
+    /// value may be double-quoted to contain spaces; the remaining words form the message query.
+    pub fn parse(query: &str, case_sensitive: bool) -> Self {
+        let (mut author, mut path, mut change) = (None, None, None);
+        let mut words = Vec::new();
+        let mut remaining = query.trim_start();
+        while !remaining.is_empty() {
+            let Some(prefix) = ["author:", "file:", "change:"]
+                .into_iter()
+                .find(|prefix| remaining.starts_with(prefix))
+            else {
+                let end = remaining
+                    .find(char::is_whitespace)
+                    .unwrap_or(remaining.len());
+                words.push(&remaining[..end]);
+                remaining = remaining[end..].trim_start();
+                continue;
+            };
+            let value_and_rest = &remaining[prefix.len()..];
+            let (value, rest) = match value_and_rest.strip_prefix('"') {
+                Some(quoted) => quoted.split_once('"').unwrap_or((quoted, "")),
+                None => {
+                    let end = value_and_rest
+                        .find(char::is_whitespace)
+                        .unwrap_or(value_and_rest.len());
+                    value_and_rest.split_at(end)
+                }
+            };
+            let value = (!value.is_empty()).then(|| value.to_string());
+            match prefix {
+                "author:" => author = value,
+                "file:" => path = value,
+                _ => change = value,
+            }
+            remaining = rest.trim_start();
+        }
+        Self {
+            query: words.join(" ").into(),
+            case_sensitive,
+            author,
+            path,
+            change,
+        }
+    }
 }
 
 pub fn commit_hash_search_query(query: &str) -> Option<&str> {
@@ -3683,23 +3758,40 @@ impl GitRepository for RealGitRepository {
         let git = self.git_binary();
 
         async move {
-            let log_source_args = log_source.get_args();
-            let mut args = vec!["log", SEARCH_COMMIT_FORMAT];
             let hash_query = commit_hash_search_query(search_args.query.as_str())
                 .map(|query| query.to_ascii_lowercase());
+            let author_arg = search_args
+                .author
+                .as_ref()
+                .map(|author| format!("--author={author}"));
+            // `git log -L` ignores pickaxe filters, so passing one along would report
+            // every commit in the line history as a match.
+            let change_arg = search_args
+                .change
+                .as_ref()
+                .filter(|_| !matches!(log_source, LogSource::Lines { .. }))
+                .map(|change| format!("-S{change}"));
+            let log_source_args = log_source.get_args();
 
-            if hash_query.is_none() {
-                args.push("--fixed-strings");
-
-                if !search_args.case_sensitive {
-                    args.push("--regexp-ignore-case");
-                }
-
+            let mut args = vec!["log", SEARCH_COMMIT_FORMAT, "--fixed-strings"];
+            if !search_args.case_sensitive {
+                args.push("--regexp-ignore-case");
+            }
+            if hash_query.is_none() && !search_args.query.is_empty() {
                 args.push("--grep");
                 args.push(search_args.query.as_str());
             }
-
+            args.extend(author_arg.as_deref());
+            args.extend(change_arg.as_deref());
             args.extend(log_source_args.iter().map(|arg| arg.as_ref()));
+            // The source's args end with the `--` terminator, so the path filter goes after
+            // them. `Lines` cannot take a pathspec (git rejects it), and for `Path` a second
+            // pathspec would widen the log instead of narrowing it.
+            if let Some(path) = &search_args.path
+                && !log_source.is_path_history()
+            {
+                args.push(path.as_str());
+            }
             let mut command = git.build_command(&args);
             command.stdout(Stdio::piped());
             command.stderr(Stdio::null());
@@ -4608,6 +4700,131 @@ mod tests {
     fn git_init_repo(path: &Path) {
         fs::create_dir_all(path).expect("failed to create repo directory");
         git_command(path, ["init", "-b", "main"]);
+    }
+
+    #[test]
+    fn test_search_commit_args_parse_filters() {
+        let args = SearchCommitArgs::parse(
+            r#"fix author:"Jing Wang" file:crates/git change:needle bug"#,
+            false,
+        );
+        assert_eq!(args.query.as_str(), "fix bug");
+        assert_eq!(args.author.as_deref(), Some("Jing Wang"));
+        assert_eq!(args.path.as_deref(), Some("crates/git"));
+        assert_eq!(args.change.as_deref(), Some("needle"));
+
+        let plain = SearchCommitArgs::parse("  abc123 ", true);
+        assert_eq!(plain.query.as_str(), "abc123");
+        assert!(plain.case_sensitive);
+        assert_eq!((plain.author, plain.path, plain.change), (None, None, None));
+
+        let empty_filter = SearchCommitArgs::parse("author: typo", false);
+        assert_eq!(empty_filter.author, None);
+        assert_eq!(empty_filter.query.as_str(), "typo");
+    }
+
+    #[gpui::test]
+    async fn test_search_commit_filters_and_line_history(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let path = repo_dir.path();
+        git_init_repo(path);
+        fs::write(path.join("a.txt"), "first\nsecond\n").unwrap();
+        git_command(path, ["add", "a.txt"]);
+        git_command(
+            path,
+            [
+                "commit",
+                "-m",
+                "add a",
+                "--author=Alice <alice@example.com>",
+            ],
+        );
+        let add_a: Oid = git_command_output(path, ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+        fs::write(path.join("b.txt"), "needle\n").unwrap();
+        git_command(path, ["add", "b.txt"]);
+        git_command(
+            path,
+            ["commit", "-m", "add b", "--author=Bob <bob@example.com>"],
+        );
+        let add_b: Oid = git_command_output(path, ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+        fs::write(path.join("a.txt"), "changed\nsecond\n").unwrap();
+        git_command(
+            path,
+            [
+                "commit",
+                "-am",
+                "edit a",
+                "--author=Alice <alice@example.com>",
+            ],
+        );
+        let edit_a: Oid = git_command_output(path, ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+
+        async fn search(repository: &RealGitRepository, query: &str) -> Vec<Oid> {
+            let (request_tx, request_rx) = async_channel::unbounded();
+            repository
+                .search_commits(
+                    LogSource::All,
+                    SearchCommitArgs::parse(query, false),
+                    request_tx,
+                )
+                .await
+                .unwrap();
+            let mut shas = Vec::new();
+            while let Ok(sha) = request_rx.recv().await {
+                shas.push(sha);
+            }
+            shas
+        }
+
+        assert_eq!(search(&repository, "author:bob").await, vec![add_b]);
+        assert_eq!(
+            search(&repository, "author:Alice").await,
+            vec![edit_a, add_a]
+        );
+        assert_eq!(search(&repository, "file:b.txt").await, vec![add_b]);
+        assert_eq!(search(&repository, "change:needle").await, vec![add_b]);
+        assert_eq!(search(&repository, "edit author:Alice").await, vec![edit_a]);
+
+        async fn line_history(
+            repository: &RealGitRepository,
+            start_row: u32,
+            end_row: u32,
+        ) -> Vec<Oid> {
+            let (request_tx, request_rx) = async_channel::unbounded();
+            repository
+                .initial_graph_data(
+                    LogSource::Lines {
+                        path: RepoPath::new("a.txt").unwrap(),
+                        start_row,
+                        end_row,
+                    },
+                    LogOrder::DateOrder,
+                    request_tx,
+                )
+                .await
+                .unwrap();
+            let mut shas = Vec::new();
+            while let Ok(commits) = request_rx.recv().await {
+                shas.extend(commits.iter().map(|commit| commit.sha));
+            }
+            shas
+        }
+
+        assert_eq!(line_history(&repository, 1, 1).await, vec![edit_a, add_a]);
+        assert_eq!(line_history(&repository, 2, 2).await, vec![add_a]);
     }
 
     #[gpui::test]
@@ -5887,6 +6104,11 @@ mod tests {
             LogSource::All,
             LogSource::Branch("docs/rewrite".into()),
             LogSource::Sha(Oid::from_str("0000000000000000000000000000000000000000").unwrap()),
+            LogSource::Lines {
+                path: RepoPath::new("docs/rewrite").unwrap(),
+                start_row: 1,
+                end_row: 3,
+            },
         ] {
             let args = source.get_args();
             assert_eq!(

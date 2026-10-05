@@ -4169,6 +4169,9 @@ impl GitStore {
         let search_args = SearchCommitArgs {
             query: SharedString::from(envelope.payload.query),
             case_sensitive: envelope.payload.case_sensitive,
+            author: envelope.payload.author,
+            path: envelope.payload.path,
+            change: envelope.payload.change,
         };
 
         let (request_tx, request_rx) = async_channel::unbounded();
@@ -7447,6 +7450,9 @@ impl Repository {
                             log_source: Some(log_source_to_proto(&log_source)),
                             query: search_args.query.to_string(),
                             case_sensitive: search_args.case_sensitive,
+                            author: search_args.author.clone(),
+                            path: search_args.path.clone(),
+                            change: search_args.change.clone(),
                         })
                         .await;
 
@@ -11556,6 +11562,15 @@ fn log_source_to_proto(log_source: &LogSource) -> proto::GitLogSource {
             LogSource::Path(path) => {
                 proto::git_log_source::Source::Path(path.as_unix_str().to_owned())
             }
+            LogSource::Lines {
+                path,
+                start_row,
+                end_row,
+            } => proto::git_log_source::Source::Lines(proto::GitLogSourceLines {
+                path: path.as_unix_str().to_owned(),
+                start_row: *start_row,
+                end_row: *end_row,
+            }),
         }),
     }
 }
@@ -11571,6 +11586,11 @@ fn log_source_from_proto(log_source: proto::GitLogSource) -> Result<LogSource> {
         proto::git_log_source::Source::Path(path) => {
             Ok(LogSource::Path(RepoPath::from_proto(&path)?))
         }
+        proto::git_log_source::Source::Lines(lines) => Ok(LogSource::Lines {
+            path: RepoPath::from_proto(&lines.path)?,
+            start_row: lines.start_row,
+            end_row: lines.end_row,
+        }),
     }
 }
 

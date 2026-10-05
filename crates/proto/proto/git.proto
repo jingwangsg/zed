@@ -855,12 +855,19 @@ message GetCommitDataResponse {
 
 message GitLogSourceAll {}
 
+message GitLogSourceLines {
+  string path = 1;
+  uint32 start_row = 2;
+  uint32 end_row = 3;
+}
+
 message GitLogSource {
   oneof source {
     GitLogSourceAll all = 1;
     string branch = 2;
     string sha = 3;
     string path = 4;
+    GitLogSourceLines lines = 5;
   }
 }
 
@@ -894,6 +901,9 @@ message SearchCommits {
   GitLogSource log_source = 3;
   string query = 4;
   bool case_sensitive = 5;
+  optional string author = 6;
+  optional string path = 7;
+  optional string change = 8;
 }
 
 message SearchCommitsResponse {
