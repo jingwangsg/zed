@@ -63,6 +63,14 @@ actions!(
         FileHistory,
         /// Shows the git history of the selected lines in the current file.
         LineHistory,
+        /// Lists the repository's contributors and searches the Git Graph for the chosen one.
+        Contributors,
+        /// Opens the current file as it was at a branch, tag, or commit.
+        OpenFileAtRevision,
+        /// Opens the previous revision of a file that is shown at a revision.
+        OpenPreviousFileRevision,
+        /// Opens the next revision of a file that is shown at a revision.
+        OpenNextFileRevision,
         /// Opens a permalink for the selected file on its Git hosting provider.
         OpenFilePermalink,
         /// Copies a permalink for the selected file on its Git hosting provider.

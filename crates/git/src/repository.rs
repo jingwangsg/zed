@@ -892,6 +892,20 @@ impl SearchCommitArgs {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Contributor {
+    pub name: SharedString,
+    pub email: SharedString,
+    pub commit_count: u32,
+}
+
+/// The commits that changed a file right before and right after a given revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRevisionNeighbors {
+    pub previous: Option<Oid>,
+    pub next: Option<Oid>,
+}
+
 pub fn commit_hash_search_query(query: &str) -> Option<&str> {
     let query = query.trim();
     (SHORT_SHA_LENGTH..=SHA256_HEX_LENGTH)
@@ -1299,6 +1313,15 @@ pub trait GitRepository: Send + Sync {
     ) -> BoxFuture<'_, Result<Vec<FileHistoryChangedFileSets>>>;
 
     fn commit_data_reader(&self) -> Result<CommitDataReader>;
+
+    /// Authors across all branches with their commit counts, most commits first.
+    fn contributors(&self) -> BoxFuture<'_, Result<Vec<Contributor>>>;
+
+    fn file_revision_neighbors(
+        &self,
+        path: RepoPath,
+        revision: Oid,
+    ) -> BoxFuture<'_, Result<FileRevisionNeighbors>>;
 
     fn update_ref(&self, ref_name: String, commit: String) -> BoxFuture<'_, Result<()>>;
 
@@ -2104,16 +2127,17 @@ impl GitRepository for RealGitRepository {
 
                 let output = process.output().await?;
                 let output = std::str::from_utf8(&output.stdout)?;
-                let shas = output
-                    .lines()
-                    .map(|line| {
-                        if line.ends_with("missing") {
-                            None
-                        } else {
-                            Some(line.to_string())
-                        }
-                    })
-                    .collect::<Vec<_>>();
+                let mut shas = Vec::with_capacity(revs.len());
+                for line in output.lines() {
+                    if line.ends_with("missing") {
+                        shas.push(None);
+                    } else if let Some(name) = line.strip_suffix(" ambiguous") {
+                        let name = name.strip_suffix("^{commit}").unwrap_or(name);
+                        bail!("{name} is ambiguous");
+                    } else {
+                        shas.push(Some(line.to_string()));
+                    }
+                }
 
                 if shas.len() != revs.len() {
                     // In an octopus merge, git cat-file still only outputs the first sha from MERGE_HEAD.
@@ -3127,6 +3151,79 @@ impl GitRepository for RealGitRepository {
             Ok(())
         }
         .boxed()
+    }
+
+    fn contributors(&self) -> BoxFuture<'_, Result<Vec<Contributor>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let log_source_args = LogSource::All.get_args();
+                let mut args = vec!["shortlog", "--summary", "--numbered", "--email"];
+                args.extend(log_source_args.iter().map(|arg| arg.as_ref()));
+                let output = git.run(&args).await?;
+                Ok(output
+                    .lines()
+                    .filter_map(|line| {
+                        let (count, author) = line.trim_start().split_once('\t')?;
+                        let (name, email) = match author.rsplit_once(" <") {
+                            Some((name, email)) => (name, email.trim_end_matches('>')),
+                            None => (author, ""),
+                        };
+                        Some(Contributor {
+                            name: SharedString::from(name.to_string()),
+                            email: SharedString::from(email.to_string()),
+                            commit_count: count.parse().ok()?,
+                        })
+                    })
+                    .collect())
+            })
+            .boxed()
+    }
+
+    fn file_revision_neighbors(
+        &self,
+        path: RepoPath,
+        revision: Oid,
+    ) -> BoxFuture<'_, Result<FileRevisionNeighbors>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let revision = revision.to_string();
+                // `--skip=1` steps past the revision itself when it changed the file, and
+                // past the latest change before it otherwise; both leave the content that
+                // preceded what the caller is looking at. Renames are not followed, so that
+                // stepping stops at the same point in both directions.
+                let previous = git
+                    .run(&[
+                        "log",
+                        "--format=%H",
+                        "--skip=1",
+                        "--max-count=1",
+                        &revision,
+                        "--",
+                        path.as_unix_str(),
+                    ])
+                    .await?;
+                // Topological order lists descendants before ancestors regardless of
+                // commit dates, so the last entry is the change right after the revision.
+                let range = format!("{revision}..HEAD");
+                let later = git
+                    .run(&[
+                        "log",
+                        "--format=%H",
+                        "--ancestry-path",
+                        "--topo-order",
+                        &range,
+                        "--",
+                        path.as_unix_str(),
+                    ])
+                    .await?;
+                Ok(FileRevisionNeighbors {
+                    previous: previous.lines().next().map(Oid::from_str).transpose()?,
+                    next: later.lines().last().map(Oid::from_str).transpose()?,
+                })
+            })
+            .boxed()
     }
 
     fn update_ref(&self, ref_name: String, commit: String) -> BoxFuture<'_, Result<()>> {
@@ -5132,6 +5229,106 @@ mod tests {
         assert_same_path(
             original_repo_path_from_common_dir(&repository.common_dir).unwrap(),
             repo_dir.path(),
+        );
+    }
+
+    #[gpui::test]
+    async fn test_contributors_and_file_revision_neighbors(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let path = repo_dir.path();
+        git_init_repo(path);
+        let mut shas = Vec::new();
+        for (content, author) in [
+            ("one\n", "Alice <alice@example.com>"),
+            ("two\n", "Bob <bob@example.com>"),
+            ("three\n", "Alice <alice@example.com>"),
+        ] {
+            fs::write(path.join("a.txt"), content).unwrap();
+            git_command(path, ["add", "a.txt"]);
+            git_command(
+                path,
+                [
+                    "commit",
+                    "-m",
+                    content.trim(),
+                    &format!("--author={author}"),
+                ],
+            );
+            let sha: Oid = git_command_output(path, ["rev-parse", "HEAD"])
+                .parse()
+                .unwrap();
+            shas.push(sha);
+        }
+        fs::write(path.join("other.txt"), "unrelated\n").unwrap();
+        git_command(path, ["add", "other.txt"]);
+        git_command(
+            path,
+            [
+                "commit",
+                "-m",
+                "other",
+                "--author=Alice <alice@example.com>",
+            ],
+        );
+
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+
+        let contributors = repository.contributors().await.unwrap();
+        assert_eq!(
+            contributors,
+            vec![
+                Contributor {
+                    name: "Alice".into(),
+                    email: "alice@example.com".into(),
+                    commit_count: 3,
+                },
+                Contributor {
+                    name: "Bob".into(),
+                    email: "bob@example.com".into(),
+                    commit_count: 1,
+                },
+            ]
+        );
+
+        let a_path = RepoPath::new("a.txt").unwrap();
+        let neighbors = repository
+            .file_revision_neighbors(a_path.clone(), shas[1])
+            .await
+            .unwrap();
+        assert_eq!(
+            neighbors,
+            FileRevisionNeighbors {
+                previous: Some(shas[0]),
+                next: Some(shas[2]),
+            }
+        );
+        // The unrelated commit after the last change to `a.txt` is not a neighbor.
+        let neighbors = repository
+            .file_revision_neighbors(a_path.clone(), shas[2])
+            .await
+            .unwrap();
+        assert_eq!(
+            neighbors,
+            FileRevisionNeighbors {
+                previous: Some(shas[1]),
+                next: None,
+            }
+        );
+        let neighbors = repository
+            .file_revision_neighbors(a_path, shas[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            neighbors,
+            FileRevisionNeighbors {
+                previous: None,
+                next: Some(shas[1]),
+            }
         );
     }
 

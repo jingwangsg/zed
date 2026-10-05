@@ -47,6 +47,7 @@ use zed_actions::{
     search::{SelectNextMatch, SelectPreviousMatch, ToggleCaseSensitive},
 };
 
+use anyhow::Context as _;
 use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
@@ -61,6 +62,7 @@ use util::{ResultExt, debug_panic};
 use workspace::{
     ItemNavHistory, ModalView, Workspace,
     item::{Item, ItemEvent, TabTooltipContent},
+    notifications::NotifyTaskExt as _,
 };
 
 const COMMIT_CIRCLE_RADIUS: Pixels = px(3.5);
@@ -1053,7 +1055,46 @@ pub fn init(cx: &mut App) {
 
     cx.observe_new(|workspace: &mut workspace::Workspace, _, _| {
         workspace.register_action_renderer(|div, workspace, window, cx| {
-            div.when_some(
+            div.when(
+                workspace
+                    .active_item_as::<Editor>(cx)
+                    .is_some_and(|editor| {
+                        crate::blame_ui::static_blame_target(&editor, cx).is_some()
+                    }),
+                |div| {
+                    let workspace = workspace.weak_handle();
+                    div.on_action({
+                        let workspace = workspace.clone();
+                        move |_: &git::OpenPreviousFileRevision, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    crate::blame_ui::open_adjacent_file_revision(
+                                        workspace,
+                                        crate::blame_ui::FileRevisionStep::Previous,
+                                        window,
+                                        cx,
+                                    )
+                                })
+                                .ok();
+                        }
+                    })
+                    .on_action(
+                        move |_: &git::OpenNextFileRevision, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    crate::blame_ui::open_adjacent_file_revision(
+                                        workspace,
+                                        crate::blame_ui::FileRevisionStep::Next,
+                                        window,
+                                        cx,
+                                    )
+                                })
+                                .ok();
+                        },
+                    )
+                },
+            )
+            .when_some(
                 resolve_file_history_target(workspace, window, cx),
                 |div, (repo_id, log_source)| {
                     let git_store = workspace.project().read(cx).git_store().clone();
@@ -1082,7 +1123,55 @@ pub fn init(cx: &mut App) {
                 |div| {
                     let git_store = workspace.project().read(cx).git_store().clone();
                     let workspace = workspace.weak_handle();
-                    div.on_action(move |_: &git::LineHistory, window, cx| {
+                    div.on_action({
+                        let workspace = workspace.clone();
+                        move |_: &git::OpenFileAtRevision, window, cx| {
+                            let Ok(Some((_, repository, repo_path))) = workspace
+                                .update(cx, |workspace, cx| {
+                                    active_editor_repository_path(workspace, cx)
+                                })
+                            else {
+                                return;
+                            };
+                            let revision = crate::picker_prompt::text_prompt(
+                                "Open file at revision",
+                                "Branch, tag, or commit",
+                                workspace.clone(),
+                                window,
+                                cx,
+                            );
+                            let workspace = workspace.clone();
+                            window
+                                .spawn(cx, {
+                                    let workspace = workspace.clone();
+                                    async move |cx| {
+                                        let Some(revision) =
+                                            revision.await.filter(|revision| !revision.is_empty())
+                                        else {
+                                            return Ok(());
+                                        };
+                                        let sha = repository
+                                            .update(cx, |repository, _| {
+                                                repository.revparse(revision.clone())
+                                            })
+                                            .await??
+                                            .with_context(|| {
+                                                format!(
+                                                    "{revision} is not a branch, tag, or commit"
+                                                )
+                                            })?;
+                                        cx.update(|window, cx| {
+                                            crate::blame_ui::open_buffer_blame_at_revision(
+                                                repository, workspace, repo_path, sha, window, cx,
+                                            )
+                                        })?;
+                                        anyhow::Ok(())
+                                    }
+                                })
+                                .detach_and_notify_err(workspace, window, cx);
+                        }
+                    })
+                    .on_action(move |_: &git::LineHistory, window, cx| {
                         let Ok(Some((buffer, selection, repo_id, repo_path))) = workspace
                             .update(cx, |workspace, cx| line_history_selection(workspace, cx))
                         else {
@@ -1170,6 +1259,78 @@ pub fn init(cx: &mut App) {
                                     );
                                 })
                                 .ok();
+                        }
+                    })
+                    .on_action({
+                        let workspace = workspace.clone();
+                        move |_: &git::Contributors, window, cx| {
+                            let Ok(Some(repository)) = workspace.update(cx, |workspace, cx| {
+                                workspace.project().read(cx).active_repository(cx)
+                            }) else {
+                                return;
+                            };
+                            let repo_id = repository.read(cx).id;
+                            let contributors =
+                                repository.update(cx, |repository, _| repository.contributors());
+                            let workspace = workspace.clone();
+                            window
+                                .spawn(cx, {
+                                    let workspace = workspace.clone();
+                                    async move |cx| {
+                                        let contributors = contributors.await??;
+                                        let options = contributors
+                                            .iter()
+                                            .map(|contributor| {
+                                                let commits = match contributor.commit_count {
+                                                    1 => "1 commit".to_string(),
+                                                    count => format!("{count} commits"),
+                                                };
+                                                SharedString::from(format!(
+                                                    "{} <{}>  {commits}",
+                                                    contributor.name, contributor.email
+                                                ))
+                                            })
+                                            .collect();
+                                        let picked = cx
+                                            .update(|window, cx| {
+                                                crate::picker_prompt::prompt(
+                                                    "Contributors",
+                                                    options,
+                                                    workspace.clone(),
+                                                    window,
+                                                    cx,
+                                                )
+                                            })?
+                                            .await;
+                                        let Some(contributor) =
+                                            picked.and_then(|index| contributors.get(index))
+                                        else {
+                                            return Ok(());
+                                        };
+                                        let query = SharedString::from(format!(
+                                            "author:\"{}\"",
+                                            contributor.email
+                                        ));
+                                        workspace.update_in(cx, |workspace, window, cx| {
+                                            let git_store =
+                                                workspace.project().read(cx).git_store().clone();
+                                            let graph = open_or_reuse_graph(
+                                                workspace,
+                                                repo_id,
+                                                git_store,
+                                                LogSource::All,
+                                                None,
+                                                window,
+                                                cx,
+                                            );
+                                            graph.update(cx, |graph, cx| {
+                                                graph.search_for(query, window, cx)
+                                            });
+                                        })?;
+                                        anyhow::Ok(())
+                                    }
+                                })
+                                .detach_and_notify_err(workspace, window, cx);
                         }
                     })
                     .on_action(move |action: &OpenAtCommit, window, cx| {
@@ -1301,7 +1462,7 @@ pub fn open_or_reuse_graph(
     sha: Option<String>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) {
+) -> Entity<GitGraph> {
     let existing = workspace.items_of_type::<GitGraph>(cx).find(|graph| {
         let graph = graph.read(cx);
         graph.repo_id == repo_id && graph.log_source == log_source
@@ -1327,12 +1488,14 @@ pub fn open_or_reuse_graph(
     };
 
     if let Some(sha) = sha {
+        let git_graph = git_graph.clone();
         cx.defer(move |cx| {
             git_graph.update(cx, |graph, cx| {
                 graph.select_commit_by_sha(sha.as_str(), cx);
             });
         });
     }
+    git_graph
 }
 
 fn lane_center_x(bounds: Bounds<Pixels>, lane: f32) -> Pixels {
@@ -2184,6 +2347,13 @@ impl GitGraph {
         cx.emit(ItemEvent::Edit);
     }
 
+    fn search_for(&mut self, query: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_state.editor.update(cx, |editor, cx| {
+            editor.set_text(query.to_string(), window, cx);
+        });
+        self.search(query, cx);
+    }
+
     fn confirm_search(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
         let query = self.search_state.editor.read(cx).text(cx).into();
         self.search(query, cx);
@@ -2531,6 +2701,10 @@ impl GitGraph {
         let repository = self
             .get_repository(cx)
             .map(|repository| repository.downgrade());
+        let history_path = match &self.log_source {
+            LogSource::Path(path) | LogSource::Lines { path, .. } => Some(path.clone()),
+            LogSource::All | LogSource::Branch(_) | LogSource::Sha(_) => None,
+        };
         let context_menu = commit_context_menu(
             CommitContextMenuData {
                 sha: commit.data.sha,
@@ -2540,6 +2714,7 @@ impl GitGraph {
                     .into_iter()
                     .map(|tag_name| SharedString::from(tag_name.to_string()))
                     .collect(),
+                history_path,
             },
             CommitContextMenuSource::GitGraph,
             ref_name,

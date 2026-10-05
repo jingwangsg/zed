@@ -703,6 +703,43 @@ message GitGetHeadShaResponse {
   optional string sha = 1;
 }
 
+message GitRevparse {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string revision = 3;
+}
+
+message GitRevparseResponse {
+  optional string sha = 1;
+}
+
+message GitContributors {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+}
+
+message GitContributorsResponse {
+  repeated GitContributor contributors = 1;
+}
+
+message GitContributor {
+  string name = 1;
+  string email = 2;
+  uint32 commit_count = 3;
+}
+
+message GitFileRevisionNeighbors {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string path = 3;
+  string revision = 4;
+}
+
+message GitFileRevisionNeighborsResponse {
+  optional string previous = 1;
+  optional string next = 2;
+}
+
 message GitEditRef {
   uint64 project_id = 1;
   uint64 repository_id = 2;

@@ -123,6 +123,10 @@ To view File History:
 - Right-click on an editor tab and select "View File History"
 - Use the Command Palette and search for "file history"
 
+### Opening a File at a Revision
+
+Right-click a commit in File History or Line History and choose "Open File at This Commit" to open the file as it was in that commit, with blame for that revision. {#action git::OpenFileAtRevision} opens the current file at a branch, tag, or commit that you type in. In a file opened this way, {#action git::OpenPreviousFileRevision} and {#action git::OpenNextFileRevision} step to the commits that changed the file just before and just after the one shown. Stepping stops at a rename, because the history before and after it is recorded under different names.
+
 ### Line History
 
 Line History narrows the list to the commits that changed the selected lines, using `git log -L`. Select the lines in the editor, then right-click and choose "View Line History" or run {#action git::LineHistory}. The lines are counted in the committed version of the file, so uncommitted edits above the selection do not shift the range.
@@ -140,6 +144,10 @@ The search box in the Git Graph matches commit messages and commit hashes. Add f
 - `change:<text>` keeps commits that add or remove the text, like `git log -S`
 
 Quote a value that contains spaces, as in `author:"Ada Lovelace"`. Any remaining words are matched against the commit message. The `file:` filter is ignored in File History and Line History, which are already limited to one file, and `change:` has no effect in Line History.
+
+### Contributors
+
+{#action git::Contributors} lists the authors in the repository with their commit counts. Choosing one opens the Git Graph with the search set to that author.
 
 ## Fetch, Push, and Pull
 

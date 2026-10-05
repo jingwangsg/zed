@@ -519,6 +519,11 @@ impl Server {
             .add_request_handler(forward_read_only_project_request::<proto::GitGetWorktrees>)
             .add_request_handler(forward_read_only_project_request::<proto::GitWorktreeCreatedAt>)
             .add_request_handler(forward_read_only_project_request::<proto::GitGetHeadSha>)
+            .add_request_handler(forward_read_only_project_request::<proto::GitRevparse>)
+            .add_request_handler(forward_read_only_project_request::<proto::GitContributors>)
+            .add_request_handler(
+                forward_read_only_project_request::<proto::GitFileRevisionNeighbors>,
+            )
             .add_request_handler(forward_read_only_project_request::<proto::GetCommitData>)
             .add_request_stream_handler(
                 forward_read_only_project_stream_request::<proto::GetInitialGraphData>,

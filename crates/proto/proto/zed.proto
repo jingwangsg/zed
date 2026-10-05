@@ -529,7 +529,13 @@ message Envelope {
     GitCreateTag git_create_tag = 497;
     GitMerge git_merge = 498;
     GitRebase git_rebase = 499;
-    GitResolveInProgressOperation git_resolve_in_progress_operation = 500; // current max
+    GitResolveInProgressOperation git_resolve_in_progress_operation = 500;
+    GitRevparse git_revparse = 501;
+    GitRevparseResponse git_revparse_response = 502;
+    GitContributors git_contributors = 503;
+    GitContributorsResponse git_contributors_response = 504;
+    GitFileRevisionNeighbors git_file_revision_neighbors = 505;
+    GitFileRevisionNeighborsResponse git_file_revision_neighbors_response = 506; // current max
   }
 
   reserved 87 to 88;

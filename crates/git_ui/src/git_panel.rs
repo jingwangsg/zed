@@ -7187,6 +7187,7 @@ impl GitPanel {
             CommitContextMenuData {
                 sha: commit.sha,
                 tag_names: commit.tag_names,
+                history_path: None,
             },
             CommitContextMenuSource::GitPanel,
             None,

@@ -4,7 +4,7 @@ use crate::report_git_operation;
 use anyhow::Result;
 use futures::channel::oneshot;
 use git::Oid;
-use git::repository::{MergeKind, ResetMode};
+use git::repository::{MergeKind, RepoPath, ResetMode};
 use gpui::{
     Action, ClipboardItem, Context, Entity, FocusHandle, PromptLevel, SharedString, WeakEntity,
     Window, actions,
@@ -33,6 +33,9 @@ const CUSTOM_GIT_COMMANDS_DOCS_SLUG: &str = "tasks#custom-git-commands";
 pub(crate) struct CommitContextMenuData {
     pub(crate) sha: Oid,
     pub(crate) tag_names: Vec<SharedString>,
+    /// Set when the commit was listed in a file's history, which makes opening that file
+    /// at the commit meaningful.
+    pub(crate) history_path: Option<RepoPath>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -225,6 +228,7 @@ pub(crate) fn commit_context_menu(
                     menu,
                     sha,
                     is_head_commit,
+                    commit.history_path.clone(),
                     repository,
                     workspace.clone(),
                 ),
@@ -280,11 +284,29 @@ fn commit_operation_entries(
     menu: ContextMenu,
     sha: Oid,
     is_head_commit: bool,
+    history_path: Option<RepoPath>,
     repository: WeakEntity<Repository>,
     workspace: WeakEntity<Workspace>,
 ) -> ContextMenu {
     let sha_short = SharedString::from(sha.display_short());
     menu.separator()
+        .when_some(history_path, |menu, path| {
+            let repository = repository.clone();
+            let workspace = workspace.clone();
+            menu.entry("Open File at This Commit", None, move |window, cx| {
+                let Some(repository) = repository.upgrade() else {
+                    return;
+                };
+                crate::blame_ui::open_buffer_blame_at_revision(
+                    repository,
+                    workspace.clone(),
+                    path.clone(),
+                    sha,
+                    window,
+                    cx,
+                );
+            })
+        })
         .item(
             ContextMenuEntry::new("Checkout Commit (Detached HEAD)")
                 .disabled(is_head_commit)

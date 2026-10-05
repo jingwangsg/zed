@@ -613,7 +613,7 @@ fn deploy_blame_entry_context_menu(
     });
 }
 
-fn open_buffer_blame_at_revision(
+pub(crate) fn open_buffer_blame_at_revision(
     repository: Entity<Repository>,
     workspace: WeakEntity<Workspace>,
     path: RepoPath,
@@ -714,6 +714,69 @@ fn open_buffer_blame_at_revision(
         .detach_and_notify_err(workspace, window, cx);
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum FileRevisionStep {
+    Previous,
+    Next,
+}
+
+/// Opens the file shown in the active editor at the revision that changed it just
+/// before or just after the one on display. Only editors opened at a revision carry
+/// the static blame that names that revision.
+pub(crate) fn open_adjacent_file_revision(
+    workspace: &mut Workspace,
+    step: FileRevisionStep,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(editor) = workspace.active_item_as::<Editor>(cx) else {
+        return;
+    };
+    let Some((repository, path, revision)) = static_blame_target(&editor, cx) else {
+        return;
+    };
+    let neighbors = repository.update(cx, |repository, _| {
+        repository.file_revision_neighbors(path.clone(), revision)
+    });
+    let workspace = workspace.weak_handle();
+    window
+        .spawn(cx, {
+            let workspace = workspace.clone();
+            async move |cx| {
+                let neighbors = neighbors.await??;
+                let (neighbor, direction) = match step {
+                    FileRevisionStep::Previous => (neighbors.previous, "earlier"),
+                    FileRevisionStep::Next => (neighbors.next, "later"),
+                };
+                let Some(neighbor) = neighbor else {
+                    anyhow::bail!(
+                        "{} has no {direction} revision",
+                        path.display(PathStyle::local())
+                    );
+                };
+                cx.update(|window, cx| {
+                    open_buffer_blame_at_revision(repository, workspace, path, neighbor, window, cx)
+                })?;
+                anyhow::Ok(())
+            }
+        })
+        .detach_and_notify_err(workspace, window, cx);
+}
+
+pub(crate) fn static_blame_target(
+    editor: &Entity<Editor>,
+    cx: &App,
+) -> Option<(Entity<Repository>, RepoPath, Oid)> {
+    let editor = editor.read(cx);
+    let blame = editor.blame()?.read(cx);
+    let revision = blame.highlighted_sha()?;
+    let buffer = editor.buffer().read(cx).as_singleton()?;
+    let repository = blame.repository(cx, buffer.read(cx).remote_id())?;
+    let file = buffer.read(cx).file()?;
+    let blob = (file.as_ref() as &dyn std::any::Any).downcast_ref::<GitBlob>()?;
+    Some((repository, blob.path.clone(), revision))
+}
+
 fn activate_existing_blame_editor(
     workspace: &mut Workspace,
     repository: &Entity<Repository>,
@@ -744,18 +807,12 @@ fn existing_blame_editor(
         .flat_map(|pane| pane.read(cx).items())
         .find_map(|item| {
             let editor = item.downcast::<Editor>()?;
-            let blame = editor.read(cx).blame()?;
-            if blame.read(cx).highlighted_sha() != Some(revision) {
-                return None;
-            }
-            let buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
-            let buffer_id = buffer.read(cx).remote_id();
-            if blame.read(cx).repository(cx, buffer_id).as_ref() != Some(repository) {
-                return None;
-            }
-            let file = buffer.read(cx).file()?;
-            let blob = (file.as_ref() as &dyn std::any::Any).downcast_ref::<GitBlob>()?;
-            (blob.path == *path).then_some(editor)
+            let (editor_repository, editor_path, editor_revision) =
+                static_blame_target(&editor, cx)?;
+            (editor_revision == revision
+                && editor_repository == *repository
+                && editor_path == *path)
+                .then_some(editor)
         })
 }
 

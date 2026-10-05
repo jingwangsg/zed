@@ -37,11 +37,12 @@ use git::{
     parse_git_remote_url,
     repository::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
-        CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions, FileHistoryChangedFileSets,
-        GitCommitTemplate, GitRepository, GitRepositoryCheckpoint, InProgressOperation,
-        InProgressOperationAction, InitialGraphCommitData, LogOrder, LogSource, MergeKind,
-        PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs,
-        UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag, is_binary_content,
+        Contributor, CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions,
+        FileHistoryChangedFileSets, FileRevisionNeighbors, GitCommitTemplate, GitRepository,
+        GitRepositoryCheckpoint, InProgressOperation, InProgressOperationAction,
+        InitialGraphCommitData, LogOrder, LogSource, MergeKind, PushOptions, Remote,
+        RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus,
+        Worktree as GitWorktree, delete_branch_flag, is_binary_content,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -1099,6 +1100,9 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_rename_worktree);
         client.add_entity_request_handler(Self::handle_worktree_created_at);
         client.add_entity_request_handler(Self::handle_get_head_sha);
+        client.add_entity_request_handler(Self::handle_revparse);
+        client.add_entity_request_handler(Self::handle_contributors);
+        client.add_entity_request_handler(Self::handle_file_revision_neighbors);
         client.add_entity_request_handler(Self::handle_edit_ref);
         client.add_entity_request_handler(Self::handle_repair_worktrees);
         client.add_entity_request_handler(Self::handle_get_commit_data);
@@ -3985,6 +3989,67 @@ impl GitStore {
 
         Ok(proto::GitWorktreeCreatedAtResponse {
             created_at: created_at.map(Into::into),
+        })
+    }
+
+    async fn handle_revparse(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitRevparse>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitRevparseResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let sha = repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.revparse(envelope.payload.revision)
+            })
+            .await??;
+        Ok(proto::GitRevparseResponse {
+            sha: sha.map(|sha| sha.to_string()),
+        })
+    }
+
+    async fn handle_contributors(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitContributors>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitContributorsResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let contributors = repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.contributors()
+            })
+            .await??;
+        Ok(proto::GitContributorsResponse {
+            contributors: contributors
+                .into_iter()
+                .map(|contributor| proto::GitContributor {
+                    name: contributor.name.to_string(),
+                    email: contributor.email.to_string(),
+                    commit_count: contributor.commit_count,
+                })
+                .collect(),
+        })
+    }
+
+    async fn handle_file_revision_neighbors(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitFileRevisionNeighbors>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitFileRevisionNeighborsResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let path = RepoPath::from_proto(&envelope.payload.path)?;
+        let revision = Oid::from_str(&envelope.payload.revision)?;
+        let neighbors = repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.file_revision_neighbors(path, revision)
+            })
+            .await??;
+        Ok(proto::GitFileRevisionNeighborsResponse {
+            previous: neighbors.previous.map(|sha| sha.to_string()),
+            next: neighbors.next.map(|sha| sha.to_string()),
         })
     }
 
@@ -9488,6 +9553,97 @@ impl Repository {
                             "checkout_branch_in_worktree not supported for remote repositories"
                         );
                         Ok(())
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn revparse(&mut self, revision: String) -> oneshot::Receiver<Result<Option<Oid>>> {
+        let id = self.id;
+        self.send_job("revparse", None, move |repo, _cx| async move {
+            let sha = match repo {
+                // Peeling resolves an annotated tag to the commit it names, and turns
+                // trees and blobs into a missing object, which reads as an unknown revision.
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => backend
+                    .revparse_batch(vec![format!("{revision}^{{commit}}")])
+                    .await?
+                    .into_iter()
+                    .next()
+                    .flatten(),
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    client
+                        .request(proto::GitRevparse {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                            revision,
+                        })
+                        .await?
+                        .sha
+                }
+            };
+            sha.map(|sha| Oid::from_str(&sha)).transpose()
+        })
+    }
+
+    pub fn contributors(&mut self) -> oneshot::Receiver<Result<Vec<Contributor>>> {
+        let id = self.id;
+        self.send_job("contributors", None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.contributors().await
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    let response = client
+                        .request(proto::GitContributors {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                        })
+                        .await?;
+                    Ok(response
+                        .contributors
+                        .into_iter()
+                        .map(|contributor| Contributor {
+                            name: contributor.name.into(),
+                            email: contributor.email.into(),
+                            commit_count: contributor.commit_count,
+                        })
+                        .collect())
+                }
+            }
+        })
+    }
+
+    pub fn file_revision_neighbors(
+        &mut self,
+        path: RepoPath,
+        revision: Oid,
+    ) -> oneshot::Receiver<Result<FileRevisionNeighbors>> {
+        let id = self.id;
+        self.send_job(
+            "file_revision_neighbors",
+            None,
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.file_revision_neighbors(path, revision).await
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        let response = client
+                            .request(proto::GitFileRevisionNeighbors {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                path: path.as_unix_str().to_owned(),
+                                revision: revision.to_string(),
+                            })
+                            .await?;
+                        Ok(FileRevisionNeighbors {
+                            previous: response
+                                .previous
+                                .map(|sha| Oid::from_str(&sha))
+                                .transpose()?,
+                            next: response.next.map(|sha| Oid::from_str(&sha)).transpose()?,
+                        })
                     }
                 }
             },

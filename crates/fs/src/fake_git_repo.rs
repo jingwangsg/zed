@@ -12,10 +12,11 @@ use git::{
     blame::Blame,
     repository::{
         AskPassDelegate, Branch, CommitData, CommitDataReader, CommitDetails, CommitOptions,
-        CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, GRAPH_CHUNK_SIZE,
-        GitRepository, GitRepositoryCheckpoint, InProgressOperation, InProgressOperationAction,
-        InitialGraphCommitData, LogOrder, LogSource, MergeKind, PushOptions, RefEdit, Remote,
-        RepoPath, ResetMode, SearchCommitArgs, Worktree, commit_hash_search_query,
+        Contributor, CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets,
+        FileRevisionNeighbors, GRAPH_CHUNK_SIZE, GitRepository, GitRepositoryCheckpoint,
+        InProgressOperation, InProgressOperationAction, InitialGraphCommitData, LogOrder,
+        LogSource, MergeKind, PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs,
+        Worktree, commit_hash_search_query,
     },
     stash::GitStash,
     status::{
@@ -266,7 +267,10 @@ impl GitRepository for FakeGitRepository {
         self.with_state_async(false, |state| {
             Ok(revs
                 .into_iter()
-                .map(|rev| state.refs.get(&rev).cloned())
+                .map(|rev| {
+                    let name = rev.strip_suffix("^{commit}").unwrap_or(&rev);
+                    state.refs.get(name).cloned()
+                })
                 .collect())
         })
     }
@@ -1727,6 +1731,56 @@ impl GitRepository for FakeGitRepository {
                 }
             })?
         }))
+    }
+
+    fn contributors(&self) -> BoxFuture<'_, Result<Vec<Contributor>>> {
+        self.with_state_async(false, |state| {
+            let mut counts: HashMap<(SharedString, SharedString), u32> = HashMap::default();
+            for entry in state.commit_data.values() {
+                let FakeCommitDataEntry::Success(commit) = entry else {
+                    continue;
+                };
+                *counts
+                    .entry((commit.author_name.clone(), commit.author_email.clone()))
+                    .or_default() += 1;
+            }
+            let mut contributors: Vec<Contributor> = counts
+                .into_iter()
+                .map(|((name, email), commit_count)| Contributor {
+                    name,
+                    email,
+                    commit_count,
+                })
+                .collect();
+            contributors.sort_by(|a, b| {
+                b.commit_count
+                    .cmp(&a.commit_count)
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+            Ok(contributors)
+        })
+    }
+
+    fn file_revision_neighbors(
+        &self,
+        _path: RepoPath,
+        revision: Oid,
+    ) -> BoxFuture<'_, Result<FileRevisionNeighbors>> {
+        self.with_state_async(false, move |state| {
+            let index = state
+                .graph_commits
+                .iter()
+                .position(|commit| commit.sha == revision);
+            Ok(FileRevisionNeighbors {
+                previous: index
+                    .and_then(|index| state.graph_commits.get(index + 1))
+                    .map(|commit| commit.sha),
+                next: index
+                    .and_then(|index| index.checked_sub(1))
+                    .and_then(|index| state.graph_commits.get(index))
+                    .map(|commit| commit.sha),
+            })
+        })
     }
 
     fn update_ref(&self, ref_name: String, commit: String) -> BoxFuture<'_, Result<()>> {
