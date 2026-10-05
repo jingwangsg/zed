@@ -28,12 +28,26 @@ pub enum DiffBase {
     Head,
     Index,
     Staged,
-    Merge { base_ref: SharedString },
+    /// The working tree against the merge base of `base_ref` and HEAD.
+    Merge {
+        base_ref: SharedString,
+    },
+    /// The working tree against `base_ref` itself.
+    Ref {
+        base_ref: SharedString,
+    },
 }
 
 impl DiffBase {
-    pub fn is_merge_base(&self) -> bool {
-        matches!(self, DiffBase::Merge { .. })
+    pub fn uses_tree_diff(&self) -> bool {
+        matches!(self, DiffBase::Merge { .. } | DiffBase::Ref { .. })
+    }
+
+    pub fn base_ref(&self) -> Option<&SharedString> {
+        match self {
+            DiffBase::Merge { base_ref } | DiffBase::Ref { base_ref } => Some(base_ref),
+            DiffBase::Head | DiffBase::Index | DiffBase::Staged => None,
+        }
     }
 }
 
@@ -84,9 +98,9 @@ impl DiffBufferList {
             };
 
             if should_update {
-                // Merge-base lists refresh after the tree diff reloads; other
+                // Tree-diff lists refresh after the tree diff reloads; other
                 // bases have no tree diff, so notify consumers immediately.
-                if !this.diff_base.is_merge_base() {
+                if !this.diff_base.uses_tree_diff() {
                     cx.emit(BranchDiffEvent::FileListChanged);
                 }
                 *this.update_needed.borrow_mut() = ();
@@ -225,7 +239,7 @@ impl DiffBufferList {
     }
 
     fn spawn_reload_tree_diff(&mut self, cx: &mut Context<Self>) {
-        if !self.diff_base.is_merge_base() {
+        if !self.diff_base.uses_tree_diff() {
             return;
         }
 
@@ -245,8 +259,22 @@ impl DiffBufferList {
 
     pub async fn reload_tree_diff(this: WeakEntity<Self>, cx: &mut AsyncApp) -> Result<()> {
         let tasks = this.update(cx, |this, cx| {
-            let DiffBase::Merge { base_ref } = this.diff_base.clone() else {
-                return None;
+            let (committed, worktree) = match this.diff_base.clone() {
+                DiffBase::Merge { base_ref } => (
+                    DiffTreeType::MergeBase {
+                        base: base_ref.clone(),
+                        head: "HEAD".into(),
+                    },
+                    DiffTreeType::MergeBaseWithWorktree { base: base_ref },
+                ),
+                DiffBase::Ref { base_ref } => (
+                    DiffTreeType::Since {
+                        base: base_ref.clone(),
+                        head: "HEAD".into(),
+                    },
+                    DiffTreeType::RefWithWorktree { base: base_ref },
+                ),
+                DiffBase::Head | DiffBase::Index | DiffBase::Staged => return None,
             };
             let Some(repo) = this.repo.as_ref() else {
                 this.committed_tree_diff.take();
@@ -255,16 +283,7 @@ impl DiffBufferList {
                 return None;
             };
             Some(repo.update(cx, |repo, cx| {
-                (
-                    repo.diff_tree(
-                        DiffTreeType::MergeBase {
-                            base: base_ref.clone(),
-                            head: "HEAD".into(),
-                        },
-                        cx,
-                    ),
-                    repo.diff_tree(DiffTreeType::MergeBaseWithWorktree { base: base_ref }, cx),
-                )
+                (repo.diff_tree(committed, cx), repo.diff_tree(worktree, cx))
             }))
         })?;
         let Some((committed_task, worktree_task)) = tasks else {
@@ -296,7 +315,7 @@ impl DiffBufferList {
         let Some(repo) = self.repo.clone() else {
             return output;
         };
-        if self.diff_base.is_merge_base() && self.tree_diff.is_none() {
+        if self.diff_base.uses_tree_diff() && self.tree_diff.is_none() {
             return output;
         }
 
@@ -311,7 +330,7 @@ impl DiffBufferList {
                     DiffBase::Head => Some(item.status),
                     DiffBase::Index => item.status.staging().has_unstaged().then_some(item.status),
                     DiffBase::Staged => item.status.staging().has_staged().then_some(item.status),
-                    DiffBase::Merge { .. } => status_overrides_tree(
+                    DiffBase::Merge { .. } | DiffBase::Ref { .. } => status_overrides_tree(
                         item.status,
                         self.committed_tree_diff
                             .as_ref()
@@ -427,7 +446,7 @@ impl DiffBufferList {
                         .await?;
                     (index_buffer, diff)
                 }
-                DiffBase::Merge { .. } => {
+                DiffBase::Merge { .. } | DiffBase::Ref { .. } => {
                     let diff = if let Some(entry) = branch_diff {
                         let oid = match entry {
                             git::status::TreeDiffStatus::Added { .. } => None,

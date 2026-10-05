@@ -510,6 +510,10 @@ pub enum DiffTreeType {
         base: SharedString,
         head: SharedString,
     },
+    /// The working tree against a ref directly, without going through the merge base.
+    RefWithWorktree {
+        base: SharedString,
+    },
 }
 
 #[derive(Debug, PartialEq)]

@@ -108,6 +108,10 @@ See [Configuring Zed](./configuring-zed.md) for more about the Settings Editor.
 
 You can switch between modes at any time. Your preference applies to [Project Diff](#project-diff), [File History](#file-history), and [Stash Diff View](#stash-diff-view). These diff views function as [multibuffers](./multibuffers.md), allowing you to edit multiple excerpts simultaneously.
 
+### Comparing with a Branch or Ref
+
+{#action git::CompareWithBranch} picks a branch and shows the changes since its merge base with `HEAD`. That is what a pull request would contain. {#action git::CompareWithRef} asks for a branch, tag, or commit and compares the working tree with it directly. Changes that the ref has and your branch lacks then show up too, as reversed changes. The **Merge Base** / **Direct** button in the diff's toolbar switches between the two comparisons for the current base.
+
 ## File History
 
 File History shows the commit history for an individual file. Each entry displays the commit's author, timestamp, and message. Selecting a commit opens a diff view filtered to show only the changes made to that file in that commit.

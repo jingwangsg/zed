@@ -57,6 +57,8 @@ actions!(
         LeaderAndFollower,
         /// Compare with a specific branch
         CompareWithBranch,
+        /// Compare the working tree directly with a branch, tag, or commit.
+        CompareWithRef,
     ]
 );
 

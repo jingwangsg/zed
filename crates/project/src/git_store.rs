@@ -4884,6 +4884,15 @@ impl GitStore {
                     base_ref: base_ref.into(),
                 }
             }
+            proto::git_diff::DiffType::Ref => {
+                let base_ref = envelope
+                    .payload
+                    .merge_base_ref
+                    .ok_or_else(|| anyhow!("merge_base_ref is required for Ref diff type"))?;
+                DiffType::Ref {
+                    base_ref: base_ref.into(),
+                }
+            }
         };
 
         let mut diff = repository_handle
@@ -4905,8 +4914,12 @@ impl GitStore {
         mut cx: AsyncApp,
     ) -> Result<proto::GetTreeDiffResponse> {
         let repository_id = RepositoryId(request.payload.repository_id);
-        let diff_type = if request.payload.includes_worktree {
+        let diff_type = if request.payload.includes_worktree && request.payload.is_merge {
             DiffTreeType::MergeBaseWithWorktree {
+                base: request.payload.base.into(),
+            }
+        } else if request.payload.includes_worktree {
+            DiffTreeType::RefWithWorktree {
                 base: request.payload.base.into(),
             }
         } else if request.payload.is_merge {
@@ -9781,6 +9794,11 @@ impl Repository {
                             (true, true, base, "HEAD".into())
                         }
                         DiffTreeType::Since { base, head } => (false, false, base, head),
+                        // Servers from before this variant read `includes_worktree` as the
+                        // merge-base comparison, so they answer with that diff instead.
+                        DiffTreeType::RefWithWorktree { base } => {
+                            (false, true, base, "HEAD".into())
+                        }
                     };
                     let response = client
                         .request(proto::GetTreeDiff {
@@ -9848,6 +9866,10 @@ impl Repository {
                         }
                         DiffType::MergeBase { base_ref } => (
                             proto::git_diff::DiffType::MergeBase.into(),
+                            Some(base_ref.to_string()),
+                        ),
+                        DiffType::Ref { base_ref } => (
+                            proto::git_diff::DiffType::Ref.into(),
                             Some(base_ref.to_string()),
                         ),
                     };

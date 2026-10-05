@@ -1313,7 +1313,13 @@ pub trait GitRepository: Send + Sync {
 pub enum DiffType {
     HeadToIndex,
     HeadToWorktree,
-    MergeBase { base_ref: SharedString },
+    MergeBase {
+        base_ref: SharedString,
+    },
+    /// The working tree against a ref directly.
+    Ref {
+        base_ref: SharedString,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -2226,8 +2232,10 @@ impl GitRepository for RealGitRepository {
     fn diff_tree(&self, request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>> {
         let git = self.git_binary_in_worktree();
         let working_directory = self.working_directory.clone();
-        let merge_base_ref = match &request {
-            DiffTreeType::MergeBaseWithWorktree { base } => Some(base.clone()),
+        let is_merge_base = matches!(request, DiffTreeType::MergeBaseWithWorktree { .. });
+        let worktree_base = match &request {
+            DiffTreeType::MergeBaseWithWorktree { base }
+            | DiffTreeType::RefWithWorktree { base } => Some(base.clone()),
             DiffTreeType::MergeBase { .. } | DiffTreeType::Since { .. } => None,
         };
 
@@ -2269,6 +2277,17 @@ impl GitRepository for RealGitRepository {
             ]
             .map(OsString::from)
             .to_vec(),
+            DiffTreeType::RefWithWorktree { base } => [
+                "diff",
+                "--raw",
+                "-z",
+                "--abbrev=64",
+                "--no-renames",
+                base.as_str(),
+                "--",
+            ]
+            .map(OsString::from)
+            .to_vec(),
         };
 
         self.executor
@@ -2282,7 +2301,7 @@ impl GitRepository for RealGitRepository {
 
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let mut tree_diff = stdout.parse::<TreeDiff>()?;
-                let Some(merge_base_ref) = merge_base_ref else {
+                let Some(worktree_base) = worktree_base else {
                     return Ok(tree_diff);
                 };
                 let Some(working_directory) = working_directory else {
@@ -2305,7 +2324,7 @@ impl GitRepository for RealGitRepository {
                 // Files the diff reports as deleted but that exist on disk
                 // (deleted from the index or from a commit, then recreated).
                 // `git diff` compares them against the index, so compare their
-                // disk contents against the merge base ourselves.
+                // disk contents against the base tree ourselves.
                 let recreated: Vec<(RepoPath, Oid)> = status
                     .entries
                     .iter()
@@ -2328,16 +2347,21 @@ impl GitRepository for RealGitRepository {
                     return Ok(tree_diff);
                 }
 
-                let merge_base_output = git
-                    .build_command(&["merge-base", merge_base_ref.as_ref(), "HEAD"])
-                    .output()
-                    .await?;
-                if !merge_base_output.status.success() {
-                    let stderr = String::from_utf8_lossy(&merge_base_output.stderr);
-                    anyhow::bail!("git merge-base failed: {stderr}");
-                }
-                let merge_base = String::from_utf8_lossy(&merge_base_output.stdout);
-                let merge_base = merge_base.trim();
+                let base_tree = if is_merge_base {
+                    let merge_base_output = git
+                        .build_command(&["merge-base", worktree_base.as_ref(), "HEAD"])
+                        .output()
+                        .await?;
+                    if !merge_base_output.status.success() {
+                        let stderr = String::from_utf8_lossy(&merge_base_output.stderr);
+                        anyhow::bail!("git merge-base failed: {stderr}");
+                    }
+                    String::from_utf8_lossy(&merge_base_output.stdout)
+                        .trim()
+                        .to_string()
+                } else {
+                    worktree_base.to_string()
+                };
 
                 for (path, old) in recreated {
                     let full_path = working_directory.join(path.as_std_path());
@@ -2347,7 +2371,8 @@ impl GitRepository for RealGitRepository {
                     };
                     let base_entry = git
                         .build_command(
-                            &["ls-tree", merge_base, "--", path.as_unix_str()].map(OsString::from),
+                            &["ls-tree", base_tree.as_str(), "--", path.as_unix_str()]
+                                .map(OsString::from),
                         )
                         .output()
                         .await?;
@@ -2814,6 +2839,11 @@ impl GitRepository for RealGitRepository {
                     DiffType::HeadToWorktree => git.build_command(&["diff"]).output().await?,
                     DiffType::MergeBase { base_ref } => {
                         git.build_command(&["diff", "--merge-base", base_ref.as_ref(), "--"])
+                            .output()
+                            .await?
+                    }
+                    DiffType::Ref { base_ref } => {
+                        git.build_command(&["diff", base_ref.as_ref(), "--"])
                             .output()
                             .await?
                     }
@@ -5103,6 +5133,101 @@ mod tests {
             original_repo_path_from_common_dir(&repository.common_dir).unwrap(),
             repo_dir.path(),
         );
+    }
+
+    #[gpui::test]
+    async fn test_ref_worktree_diff_compares_directly(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let path = repo_dir.path();
+        git_init_repo(path);
+        fs::write(path.join("a.txt"), "base\n").unwrap();
+        git_command(path, ["add", "a.txt"]);
+        git_command(path, ["commit", "-m", "initial"]);
+        git_command(path, ["switch", "-c", "feature"]);
+        fs::write(path.join("b.txt"), "feature only\n").unwrap();
+        git_command(path, ["add", "b.txt"]);
+        git_command(path, ["commit", "-m", "add b"]);
+        git_command(path, ["switch", "main"]);
+        fs::write(path.join("a.txt"), "main\n").unwrap();
+        git_command(path, ["commit", "-am", "edit a"]);
+        // `git diff` only reports tracked files, so the uncommitted file is staged.
+        fs::write(path.join("c.txt"), "uncommitted\n").unwrap();
+        git_command(path, ["add", "c.txt"]);
+
+        let repository =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+
+        // The merge base of `feature` and `main` predates `b.txt`, so only a direct
+        // comparison reports the file that `feature` has and the working tree lacks.
+        let direct = repository
+            .diff_tree(DiffTreeType::RefWithWorktree {
+                base: "feature".into(),
+            })
+            .await
+            .unwrap();
+        let merge_base = repository
+            .diff_tree(DiffTreeType::MergeBaseWithWorktree {
+                base: "feature".into(),
+            })
+            .await
+            .unwrap();
+        let b_path = RepoPath::new("b.txt").unwrap();
+        assert!(matches!(
+            direct.entries.get(&b_path),
+            Some(TreeDiffStatus::Deleted { .. })
+        ));
+        assert!(!merge_base.entries.contains_key(&b_path));
+        for tree_diff in [&direct, &merge_base] {
+            assert!(matches!(
+                tree_diff.entries.get(&RepoPath::new("a.txt").unwrap()),
+                Some(TreeDiffStatus::Modified { .. })
+            ));
+            assert_eq!(
+                tree_diff.entries.get(&RepoPath::new("c.txt").unwrap()),
+                Some(&TreeDiffStatus::Added)
+            );
+        }
+
+        // A file that is on disk but not in the index is compared against the ref's
+        // blob, as the merge-base comparison does: identical content drops out.
+        fs::write(path.join("b.txt"), "feature only\n").unwrap();
+        let direct = repository
+            .diff_tree(DiffTreeType::RefWithWorktree {
+                base: "feature".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!direct.entries.contains_key(&b_path));
+        fs::write(path.join("b.txt"), "edited\n").unwrap();
+        let direct = repository
+            .diff_tree(DiffTreeType::RefWithWorktree {
+                base: "feature".into(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            direct.entries.get(&b_path),
+            Some(TreeDiffStatus::Modified { .. })
+        ));
+
+        let direct_patch = repository
+            .diff(DiffType::Ref {
+                base_ref: "feature".into(),
+            })
+            .await
+            .unwrap();
+        assert!(direct_patch.contains("b.txt"));
+        let merge_base_patch = repository
+            .diff(DiffType::MergeBase {
+                base_ref: "feature".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!merge_base_patch.contains("b.txt"));
     }
 
     #[gpui::test]
