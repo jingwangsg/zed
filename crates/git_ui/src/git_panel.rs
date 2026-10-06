@@ -14032,6 +14032,52 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn test_history_entry_opens_commit_view(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (fs, _project, workspace, panel, mut cx) =
+            setup_git_panel_with_changes(cx, json!({ ".git": {} }), &[]).await;
+        let dot_git = Path::new(path!("/project/.git"));
+        let sha = format!("{:040x}", 1).parse::<Oid>().unwrap();
+        fs.set_head_for_repo(dot_git, &[], sha.to_string());
+        fs.set_graph_commits(
+            dot_git,
+            vec![Arc::new(InitialGraphCommitData {
+                sha,
+                parents: Default::default(),
+                ref_names: Vec::new(),
+            })],
+        );
+        cx.run_until_parked();
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_history_tab(&ActivateHistoryTab, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert!(
+                !panel.commit_history_entries().is_empty(),
+                "the History tab should list the head commit"
+            );
+            panel.open_selected_history_commit(window, cx);
+        });
+        cx.run_until_parked();
+
+        let has_commit_view = workspace.read_with(&cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .any(|item| item.downcast::<CommitView>().is_some())
+        });
+        assert!(
+            has_commit_view,
+            "opening a History entry should add a commit view to the active pane"
+        );
+    }
+
     #[test]
     fn test_directory_discard_tracked_changes() {
         let entry = |path, status: FileStatus| GitStatusEntry {
