@@ -6,7 +6,6 @@ use crate::branch_diff::BranchDiff;
 use crate::commit_view::{CommitView, short_ref};
 use anyhow::Result;
 use futures::channel::oneshot;
-use fuzzy::{StringMatch, StringMatchCandidate};
 use git::Oid;
 use git::repository::{Branch, CommitDetails, Tag};
 use gpui::{
@@ -143,12 +142,11 @@ fn build_entries(
         {
             parts.push(format!("↑{} ↓{}", status.ahead, status.behind));
         }
-        if let Some(time) = branch
-            .most_recent_commit
-            .as_ref()
-            .and_then(|commit| relative_time(commit.commit_timestamp))
-        {
-            parts.push(time);
+        if let Some(commit) = &branch.most_recent_commit {
+            parts.push(short_ref(&commit.sha).to_string());
+            if let Some(time) = relative_time(commit.commit_timestamp) {
+                parts.push(time);
+            }
         }
         let kind = if branch.is_remote() {
             ReferenceKind::RemoteBranch
@@ -196,6 +194,110 @@ fn build_entries(
     entries
 }
 
+struct Match {
+    entry_index: usize,
+    label_positions: Vec<usize>,
+    description_positions: Vec<usize>,
+}
+
+/// VS Code's quick pick filter, which GitLens's pickers run as the user types: a
+/// case-insensitive contiguous match first, then any subsequence. Returns the matched
+/// UTF-8 byte positions.
+fn quick_pick_match(query: &str, target: &str) -> Option<Vec<usize>> {
+    let lowercase = |character: char| character.to_lowercase().next().unwrap_or(character);
+    let query: Vec<char> = query.chars().map(lowercase).collect();
+    // `windows(0)` panics, and an empty query matches nothing anyway.
+    if query.is_empty() {
+        return None;
+    }
+    // Positions index the original string, which lowercasing a copy could shift.
+    let target: Vec<(usize, char)> = target
+        .char_indices()
+        .map(|(index, character)| (index, lowercase(character)))
+        .collect();
+
+    let contiguous = target
+        .windows(query.len())
+        .find(|window| {
+            window
+                .iter()
+                .map(|(_, character)| *character)
+                .eq(query.iter().copied())
+        })
+        .map(|window| window.iter().map(|(index, _)| *index).collect());
+    if contiguous.is_some() {
+        return contiguous;
+    }
+
+    let mut positions = Vec::with_capacity(query.len());
+    let mut remaining = query.iter();
+    let mut wanted = remaining.next()?;
+    for (index, character) in &target {
+        if character == wanted {
+            positions.push(*index);
+            match remaining.next() {
+                Some(next) => wanted = next,
+                None => return Some(positions),
+            }
+        }
+    }
+    None
+}
+
+/// Filters and orders like VS Code's quick pick does with `sortByLabel`.
+fn filter_entries(entries: &[Entry], query: &str) -> Vec<Match> {
+    let (mut by_label, by_description): (Vec<Match>, Vec<Match>) = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(entry_index, entry)| {
+            let label_positions = quick_pick_match(query, &entry.reference.label());
+            let description_positions = quick_pick_match(query, &entry.description);
+            if label_positions.is_none() && description_positions.is_none() {
+                return None;
+            }
+            Some(Match {
+                entry_index,
+                label_positions: label_positions.unwrap_or_default(),
+                description_positions: description_positions.unwrap_or_default(),
+            })
+        })
+        .partition(|entry_match| !entry_match.label_positions.is_empty());
+
+    let look_for = query.to_lowercase();
+    by_label.sort_by_cached_key(|entry_match| {
+        let label = entries
+            .get(entry_match.entry_index)
+            .map(|entry| entry.reference.label().to_lowercase())
+            .unwrap_or_default();
+        let is_prefix = label.starts_with(&look_for);
+        (
+            Reverse(is_prefix),
+            if is_prefix { label.len() } else { 0 },
+            Reverse(label.ends_with(&look_for)),
+            label,
+        )
+    });
+    // Description-only matches stay in list order, as VS Code leaves them.
+    by_label.extend(by_description);
+    by_label
+}
+
+/// GitLens leaves text that already matches part of a listed name to the list's own
+/// filtering; only a full sha is looked up regardless, as its `isSha` check requires.
+fn lookup_is_redundant(entries: &[Entry], text: &str) -> bool {
+    let looks_like_sha =
+        text.len() == 40 && text.chars().all(|character| character.is_ascii_hexdigit());
+    let lowercase_text = text.to_lowercase();
+    !looks_like_sha
+        && entries.iter().any(|entry| {
+            entry
+                .reference
+                .name
+                .to_lowercase()
+                .contains(&lowercase_text)
+        })
+}
+
 enum TypedEntry {
     Commit(CommitDetails),
     Range(Comparison),
@@ -205,7 +307,7 @@ pub(crate) struct ReferencePickerDelegate {
     repository: Entity<Repository>,
     options: ReferencePickerOptions,
     entries: Vec<Entry>,
-    matches: Vec<StringMatch>,
+    matches: Vec<Match>,
     typed: Option<TypedEntry>,
     query: String,
     selected_index: usize,
@@ -248,8 +350,8 @@ impl ReferencePickerDelegate {
                 TypedEntry::Range(comparison) => ReferencePick::Range(comparison.clone()),
             });
         }
-        let string_match = self.matches.get(index.checked_sub(self.typed_offset())?)?;
-        let entry = self.entries.get(string_match.candidate_id)?;
+        let entry_match = self.matches.get(index.checked_sub(self.typed_offset())?)?;
+        let entry = self.entries.get(entry_match.entry_index)?;
         Some(ReferencePick::Reference(entry.reference.clone()))
     }
 
@@ -280,14 +382,8 @@ impl ReferencePickerDelegate {
                 };
                 (end(left), end(right))
             });
-        // Listed refs are already in the list; `#` asks for the commit anyway.
-        if range.is_none()
-            && !forced
-            && self
-                .entries
-                .iter()
-                .any(|entry| entry.reference.name.as_ref() == text)
-        {
+        // `#` asks for the commit even when the list already shows the name.
+        if range.is_none() && !forced && lookup_is_redundant(&self.entries, text) {
             self._lookup = Task::ready(());
             return;
         }
@@ -402,13 +498,13 @@ impl PickerDelegate for ReferencePickerDelegate {
     fn separators_after_indices(&self) -> Vec<usize> {
         let offset = self.typed_offset();
         let mut separators: Vec<usize> = (offset > 0).then_some(0).into_iter().collect();
-        // Fuzzy matching reorders the list by score, so the groups only line up unfiltered.
+        // Filtering sorts by match quality, so the groups only line up unfiltered.
         if !self.query.is_empty() {
             return separators;
         }
-        let group_of = |string_match: &StringMatch| {
+        let group_of = |entry_match: &Match| {
             self.entries
-                .get(string_match.candidate_id)
+                .get(entry_match.entry_index)
                 .map(|entry| match entry.reference.kind {
                     ReferenceKind::WorkingTree | ReferenceKind::Head => 0,
                     ReferenceKind::LocalBranch => 1,
@@ -438,58 +534,35 @@ impl PickerDelegate for ReferencePickerDelegate {
     fn update_matches(
         &mut self,
         query: String,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
-        let candidates: Vec<StringMatchCandidate> = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| StringMatchCandidate::new(index, &entry.reference.label()))
-            .collect();
-        let picked_index = self.options.picked.as_ref().and_then(|picked| {
-            self.entries
-                .iter()
-                .position(|entry| entry.reference.name == *picked)
-        });
-        cx.spawn_in(window, async move |picker, cx| {
-            let matches: Vec<StringMatch> = if query.is_empty() {
-                candidates
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, candidate)| StringMatch {
-                        candidate_id: index,
-                        string: candidate.string,
-                        positions: Vec::new(),
-                        score: 0.0,
-                    })
-                    .collect()
-            } else {
-                fuzzy::match_strings(
-                    &candidates,
-                    &query,
-                    true,
-                    true,
-                    10000,
-                    &Default::default(),
-                    cx.background_executor().clone(),
-                )
-                .await
-            };
-            picker
-                .update(cx, |picker, cx| {
-                    let delegate = &mut picker.delegate;
-                    delegate.matches = matches;
-                    delegate.selected_index = if query.is_empty() {
-                        picked_index.unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    delegate.query = query.clone();
-                    delegate.look_up_typed_revision(&query, cx);
+        let query = query.trim().to_string();
+        if query.is_empty() {
+            self.matches = (0..self.entries.len())
+                .map(|entry_index| Match {
+                    entry_index,
+                    label_positions: Vec::new(),
+                    description_positions: Vec::new(),
                 })
-                .log_err();
-        })
+                .collect();
+            self.selected_index = self
+                .options
+                .picked
+                .as_ref()
+                .and_then(|picked| {
+                    self.entries
+                        .iter()
+                        .position(|entry| entry.reference.name == *picked)
+                })
+                .unwrap_or(0);
+        } else {
+            self.matches = filter_entries(&self.entries, &query);
+            self.selected_index = 0;
+        }
+        self.look_up_typed_revision(&query, cx);
+        self.query = query;
+        Task::ready(())
     }
 
     fn confirm(&mut self, _: bool, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
@@ -513,52 +586,58 @@ impl PickerDelegate for ReferencePickerDelegate {
         _window: &mut Window,
         _cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
-        let (icon, label, positions, description) = match (self.typed.as_ref(), ix) {
-            (Some(TypedEntry::Commit(details)), 0) => {
-                let subject = details
-                    .message
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .to_string();
-                let mut description = details.author_name.to_string();
-                if let Some(time) = relative_time(details.commit_timestamp) {
-                    description = format!("{description}, {time}");
+        let (icon, label, label_positions, description, description_positions) =
+            match (self.typed.as_ref(), ix) {
+                (Some(TypedEntry::Commit(details)), 0) => {
+                    let subject = details
+                        .message
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    let mut description = details.author_name.to_string();
+                    if let Some(time) = relative_time(details.commit_timestamp) {
+                        description = format!("{description}, {time}");
+                    }
+                    (
+                        IconName::GitCommit,
+                        subject,
+                        Vec::new(),
+                        format!("{description} · {}", short_ref(&details.sha)),
+                        Vec::new(),
+                    )
                 }
-                (
-                    IconName::GitCommit,
-                    subject,
+                (Some(TypedEntry::Range(comparison)), 0) => (
+                    IconName::Diff,
+                    format!("{}..{}", comparison.base.label(), comparison.head.label()),
                     Vec::new(),
-                    format!("{description} · {}", short_ref(&details.sha)),
-                )
-            }
-            (Some(TypedEntry::Range(comparison)), 0) => (
-                IconName::Diff,
-                format!("{}..{}", comparison.base.label(), comparison.head.label()),
-                Vec::new(),
-                format!(
-                    "Changes from {} to {}",
-                    comparison.base.label(),
-                    comparison.head.label()
+                    format!(
+                        "Changes from {} to {}",
+                        comparison.base.label(),
+                        comparison.head.label()
+                    ),
+                    Vec::new(),
                 ),
-            ),
-            _ => {
-                let string_match = self.matches.get(ix.checked_sub(self.typed_offset())?)?;
-                let entry = self.entries.get(string_match.candidate_id)?;
-                let icon = match entry.reference.kind {
-                    ReferenceKind::WorkingTree => IconName::Folder,
-                    ReferenceKind::Head | ReferenceKind::Revision => IconName::GitCommit,
-                    ReferenceKind::LocalBranch | ReferenceKind::RemoteBranch => IconName::GitBranch,
-                    ReferenceKind::Tag => IconName::Bookmark,
-                };
-                (
-                    icon,
-                    entry.reference.label().to_string(),
-                    string_match.positions.clone(),
-                    entry.description.to_string(),
-                )
-            }
-        };
+                _ => {
+                    let entry_match = self.matches.get(ix.checked_sub(self.typed_offset())?)?;
+                    let entry = self.entries.get(entry_match.entry_index)?;
+                    let icon = match entry.reference.kind {
+                        ReferenceKind::WorkingTree => IconName::Folder,
+                        ReferenceKind::Head | ReferenceKind::Revision => IconName::GitCommit,
+                        ReferenceKind::LocalBranch | ReferenceKind::RemoteBranch => {
+                            IconName::GitBranch
+                        }
+                        ReferenceKind::Tag => IconName::Bookmark,
+                    };
+                    (
+                        icon,
+                        entry.reference.label().to_string(),
+                        entry_match.label_positions.clone(),
+                        entry.description.to_string(),
+                        entry_match.description_positions.clone(),
+                    )
+                }
+            };
 
         Some(
             ListItem::new(("reference", ix))
@@ -570,10 +649,10 @@ impl PickerDelegate for ReferencePickerDelegate {
                     h_flex()
                         .gap_2()
                         .min_w_0()
-                        .child(HighlightedLabel::new(label, positions))
+                        .child(HighlightedLabel::new(label, label_positions))
                         .when(!description.is_empty(), |this| {
                             this.child(
-                                Label::new(description)
+                                HighlightedLabel::new(description, description_positions)
                                     .size(LabelSize::Small)
                                     .color(Color::Muted)
                                     .truncate(),
@@ -788,7 +867,7 @@ mod tests {
             ref_name: ref_name.to_string().into(),
             upstream: None,
             most_recent_commit: Some(CommitSummary {
-                sha: SharedString::default(),
+                sha: format!("{:0<40}", "abc1234").into(),
                 subject: SharedString::default(),
                 commit_timestamp,
                 author_name: SharedString::default(),
@@ -843,6 +922,79 @@ mod tests {
         assert_eq!(entries[4].reference.kind, ReferenceKind::Tag);
         assert!(entries[4].description.starts_with("tag · "));
         assert_eq!(entries[5].reference.kind, ReferenceKind::RemoteBranch);
+    }
+
+    #[test]
+    fn test_quick_pick_match_prefers_contiguous_then_subsequence() {
+        assert_eq!(quick_pick_match("ure", "feature"), Some(vec![4, 5, 6]));
+        assert_eq!(quick_pick_match("FEAT", "feature"), Some(vec![0, 1, 2, 3]));
+        assert_eq!(quick_pick_match("ftr", "feature"), Some(vec![0, 3, 5]));
+        assert_eq!(quick_pick_match("x", "feature"), None);
+        assert_eq!(quick_pick_match("", "feature"), None);
+    }
+
+    #[test]
+    fn test_filter_orders_like_vscode_and_matches_descriptions() {
+        let sha = format!("{:0<40}", "abc1234");
+        let branches = vec![
+            branch("refs/heads/main", true, 30),
+            branch("refs/heads/feature/main-fix", false, 20),
+            branch("refs/heads/maintenance", false, 10),
+        ];
+        let tags = vec![Tag {
+            name: "v1".into(),
+            sha: sha.parse().unwrap(),
+            commit_timestamp: 40,
+        }];
+        let entries = build_entries(&branches, &tags, &options(false, None));
+        let labels = |matches: &[Match]| {
+            matches
+                .iter()
+                .map(|entry_match| {
+                    entries[entry_match.entry_index]
+                        .reference
+                        .label()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Label matches first: prefix matches shortest first, then the substring match.
+        assert_eq!(
+            labels(&filter_entries(&entries, "main")),
+            ["main", "maintenance", "feature/main-fix"]
+        );
+        // A sha fragment is found in the descriptions, in list order.
+        let by_sha = filter_entries(&entries, "abc1234");
+        assert_eq!(
+            labels(&by_sha),
+            ["main", "feature/main-fix", "maintenance", "v1"]
+        );
+        assert!(
+            by_sha
+                .iter()
+                .all(|entry_match| entry_match.label_positions.is_empty())
+        );
+        assert!(
+            by_sha
+                .iter()
+                .all(|entry_match| !entry_match.description_positions.is_empty())
+        );
+    }
+
+    #[test]
+    fn test_lookup_is_skipped_for_text_the_list_already_shows() {
+        let branches = vec![branch("refs/heads/backup-abc1234", false, 1)];
+        let entries = build_entries(&branches, &[], &options(false, None));
+        assert!(lookup_is_redundant(&entries, "hea"));
+        assert!(lookup_is_redundant(&entries, "HEAD"));
+        assert!(lookup_is_redundant(&entries, "backup"));
+        assert!(lookup_is_redundant(&entries, "abc1234"));
+        assert!(!lookup_is_redundant(
+            &entries,
+            &format!("{:0<40}", "abc1234")
+        ));
+        assert!(!lookup_is_redundant(&entries, "no-such-ref"));
     }
 
     #[gpui::test]
@@ -914,6 +1066,20 @@ mod tests {
         picker
             .read_with(cx, |picker, _| {
                 assert_eq!(picker.delegate.match_count(), 0);
+            })
+            .unwrap();
+
+        // Part of a listed name filters the list without a lookup, so HEAD stays a ref entry.
+        query(&picker, cx, "hea").await;
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        picker
+            .read_with(cx, |picker, _| {
+                assert_eq!(picker.delegate.match_count(), 1);
+                assert_eq!(
+                    picker.delegate.pick_at(0),
+                    Some(ReferencePick::Reference(PickedReference::head()))
+                );
             })
             .unwrap();
     }
