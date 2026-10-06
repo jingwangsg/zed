@@ -1697,12 +1697,15 @@ impl GitRepository for RealGitRepository {
         let git = self.git_binary();
         self.executor
             .spawn(async move {
+                // An annotated tag would otherwise print the tag object ahead of the
+                // commit, which the field split below cannot tell apart from the sha.
+                let revision = format!("{commit}^{{commit}}");
                 let output = git
                     .build_command(&[
                         "show",
                         "--no-patch",
                         "--format=%H%x00%B%x00%at%x00%ae%x00%an%x00",
-                        &commit,
+                        &revision,
                         // `commit` reaches here as whatever the user typed, so it can name
                         // a branch that also names a path in the working tree.
                         "--",

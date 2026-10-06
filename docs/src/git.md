@@ -110,7 +110,9 @@ You can switch between modes at any time. Your preference applies to [Project Di
 
 ### Comparing with a Branch or Ref
 
-{#action git::CompareWithBranch} picks a branch and shows the changes since its merge base with `HEAD`. That is what a pull request would contain. {#action git::CompareWithRef} asks for a branch, tag, or commit and compares the working tree with it directly. Changes that the ref has and your branch lacks then show up too, as reversed changes. The **Merge Base** / **Direct** button in the diff's toolbar switches between the two comparisons for the current base.
+{#action git::CompareWithBranch} picks a branch and shows the changes since its merge base with `HEAD`. That is what a pull request would contain. {#action git::CompareWithRef} picks a branch or tag, or accepts a typed commit, and compares the working tree with it directly. Changes that the ref has and your branch lacks then show up too, as reversed changes. The **Merge Base** / **Direct** button in the diff's toolbar switches between the two comparisons for the current base.
+
+{#action git::CompareRefs} picks two refs and shows the changes from the first to the second without involving the working tree, under the second ref's commit details. Right-clicking a commit or ref in the Git Graph or in the panel's History tab offers the same comparisons: **Compare with Working Tree**, **Compare with HEAD**, and **Select for Compare** followed by **Compare with …** on a second commit or ref.
 
 ## File History
 

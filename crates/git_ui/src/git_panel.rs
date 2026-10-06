@@ -14078,6 +14078,56 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn test_open_range_shows_a_comparison_tab(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (fs, project, workspace, _panel, mut cx) =
+            setup_git_panel_with_changes(cx, json!({ ".git": {} }), &[]).await;
+        let sha = format!("{:040x}", 1).parse::<Oid>().unwrap();
+        fs.set_head_for_repo(Path::new(path!("/project/.git")), &[], sha.to_string());
+        cx.run_until_parked();
+        let repository =
+            project.read_with(&cx, |project, cx| project.active_repository(cx).unwrap());
+
+        workspace.update_in(&mut cx, |_, window, cx| {
+            CommitView::open_range(
+                "v1".into(),
+                "HEAD".into(),
+                repository.downgrade(),
+                cx.weak_entity(),
+                window,
+                cx,
+            );
+            // The same head commit on its own is a different view, not a replacement.
+            CommitView::open(
+                sha.to_string(),
+                repository.downgrade(),
+                cx.weak_entity(),
+                None,
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let tab_texts = workspace.read_with(&cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .filter_map(|item| item.downcast::<CommitView>())
+                .map(|view| workspace::Item::tab_content_text(view.read(cx), 0, cx))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(tab_texts.len(), 2, "{tab_texts:?}");
+        assert!(
+            tab_texts.iter().any(|text| text == "v1..HEAD"),
+            "{tab_texts:?}"
+        );
+    }
+
     #[test]
     fn test_directory_discard_tracked_changes() {
         let entry = |path, status: FileStatus| GitStatusEntry {

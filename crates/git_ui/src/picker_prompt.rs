@@ -120,12 +120,47 @@ pub fn prompt(
     } else if options.len() == 1 {
         return Task::ready(Some(0));
     }
+    let choice = show_prompt(prompt, options, false, workspace, window, cx);
+    window.spawn(cx, async move |_cx| match choice.await? {
+        PickerPromptChoice::Selected(index) => Some(index),
+        PickerPromptChoice::Query(_) => None,
+    })
+}
+
+/// Picks one of `refs`, or accepts the typed text when it matches none of them, so a
+/// commit can be entered where only branches and tags are listed. A secondary confirm
+/// takes the typed text even when some ref matches it. Resolves to `None` when the
+/// prompt is dismissed.
+pub fn ref_prompt(
+    prompt: &str,
+    refs: Vec<SharedString>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<Option<String>> {
+    let choice = show_prompt(prompt, refs.clone(), true, workspace, window, cx);
+    window.spawn(cx, async move |_cx| match choice.await? {
+        PickerPromptChoice::Selected(index) => {
+            refs.get(index).map(|reference| reference.to_string())
+        }
+        PickerPromptChoice::Query(query) => Some(query),
+    })
+}
+
+fn show_prompt(
+    prompt: &str,
+    options: Vec<SharedString>,
+    accept_query: bool,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<Option<PickerPromptChoice>> {
     let prompt = prompt.to_string().into();
 
     window.spawn(cx, async move |cx| {
         // Modal branch picker has a longer trailoff than a popover one.
         let (tx, rx) = oneshot::channel();
-        let delegate = PickerPromptDelegate::new(prompt, options, tx, 70);
+        let delegate = PickerPromptDelegate::new(prompt, options, accept_query, tx, 70);
 
         workspace
             .update_in(cx, |workspace, window, cx| {
@@ -135,7 +170,7 @@ pub fn prompt(
             })
             .ok();
 
-        (rx.await).ok()
+        rx.await.ok()
     })
 }
 
@@ -176,26 +211,36 @@ impl Render for PickerPrompt {
     }
 }
 
+enum PickerPromptChoice {
+    Selected(usize),
+    Query(String),
+}
+
 pub struct PickerPromptDelegate {
     prompt: Arc<str>,
     matches: Vec<StringMatch>,
     all_options: Vec<SharedString>,
+    query: String,
+    accept_query: bool,
     selected_index: usize,
     max_match_length: usize,
-    tx: Option<oneshot::Sender<usize>>,
+    tx: Option<oneshot::Sender<PickerPromptChoice>>,
 }
 
 impl PickerPromptDelegate {
-    pub fn new(
+    fn new(
         prompt: Arc<str>,
         options: Vec<SharedString>,
-        tx: oneshot::Sender<usize>,
+        accept_query: bool,
+        tx: oneshot::Sender<PickerPromptChoice>,
         max_chars: usize,
     ) -> Self {
         Self {
             prompt,
             all_options: options,
             matches: vec![],
+            query: String::new(),
+            accept_query,
             selected_index: 0,
             max_match_length: max_chars,
             tx: Some(tx),
@@ -276,6 +321,7 @@ impl PickerDelegate for PickerPromptDelegate {
             picker
                 .update(cx, |picker, _| {
                     let delegate = &mut picker.delegate;
+                    delegate.query = query;
                     delegate.matches = matches;
                     if delegate.matches.is_empty() {
                         delegate.selected_index = 0;
@@ -288,12 +334,20 @@ impl PickerDelegate for PickerPromptDelegate {
         })
     }
 
-    fn confirm(&mut self, _: bool, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        let Some(option) = self.matches.get(self.selected_index()) else {
-            return;
+    fn confirm(&mut self, secondary: bool, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        let query = self.query.trim();
+        let use_query =
+            self.accept_query && !query.is_empty() && (secondary || self.matches.is_empty());
+        let choice = if use_query {
+            PickerPromptChoice::Query(query.to_string())
+        } else {
+            match self.matches.get(self.selected_index()) {
+                Some(option) => PickerPromptChoice::Selected(option.candidate_id),
+                None => return,
+            }
         };
 
-        self.tx.take().map(|tx| tx.send(option.candidate_id));
+        self.tx.take().map(|tx| tx.send(choice));
         cx.emit(DismissEvent);
     }
 

@@ -1,4 +1,5 @@
-use crate::commit_view::CommitView;
+use crate::branch_diff::BranchDiff;
+use crate::commit_view::{CommitView, short_ref};
 use crate::picker_prompt::text_prompt;
 use crate::report_git_operation;
 use anyhow::Result;
@@ -6,10 +7,13 @@ use futures::channel::oneshot;
 use git::Oid;
 use git::repository::{MergeKind, RepoPath, ResetMode};
 use gpui::{
-    Action, ClipboardItem, Context, Entity, FocusHandle, PromptLevel, SharedString, WeakEntity,
-    Window, actions,
+    Action, ClipboardItem, Context, Entity, FocusHandle, Global, PromptLevel, SharedString,
+    WeakEntity, Window, actions,
 };
-use project::{GIT_COMMAND_TASK_TAG, git_store::Repository};
+use project::{
+    GIT_COMMAND_TASK_TAG,
+    git_store::{Repository, RepositoryId, diff_buffer_list::DiffBase},
+};
 
 use task::{TaskContext, TaskVariables, VariableName};
 use ui::{Color, ContextMenu, ContextMenuEntry, IconName, IconPosition, prelude::*};
@@ -37,6 +41,15 @@ pub(crate) struct CommitContextMenuData {
     /// at the commit meaningful.
     pub(crate) history_path: Option<RepoPath>,
 }
+
+/// The commit or ref chosen through "Select for Compare", offered as the base of the next
+/// comparison from any commit or ref menu of the same repository.
+struct CompareSelection {
+    repository_id: RepositoryId,
+    reference: SharedString,
+}
+
+impl Global for CompareSelection {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommitContextMenuSource {
@@ -138,6 +151,13 @@ pub(crate) fn commit_context_menu(
         let kind = ref_kind(&ref_name, &commit.tag_names, strong_repository.as_ref(), cx);
         (ref_name, kind)
     });
+    let repository_id = strong_repository
+        .as_ref()
+        .map(|repository| repository.read(cx).id);
+    let compare_selection = cx
+        .try_global::<CompareSelection>()
+        .filter(|selection| Some(selection.repository_id) == repository_id)
+        .map(|selection| selection.reference.clone());
 
     ContextMenu::build(window, cx, move |context_menu, _, _| {
         context_menu
@@ -240,6 +260,27 @@ pub(crate) fn commit_context_menu(
                     workspace.clone(),
                 ),
             })
+            .when_some(
+                repository.clone().zip(repository_id),
+                |menu, (repository, repository_id)| {
+                    let (reference, is_head) = match &ref_target {
+                        None => (SharedString::from(sha.to_string()), is_head_commit),
+                        Some((ref_name, ref_kind)) => (
+                            ref_name.clone(),
+                            matches!(ref_kind, RefKind::LocalBranch { is_head: true }),
+                        ),
+                    };
+                    compare_entries(
+                        menu,
+                        reference,
+                        is_head,
+                        compare_selection.clone(),
+                        repository_id,
+                        repository,
+                        workspace.clone(),
+                    )
+                },
+            )
             .map(|mut menu| {
                 menu = menu.separator().header("Custom Commands");
 
@@ -278,6 +319,91 @@ pub(crate) fn commit_context_menu(
                 menu
             })
     })
+}
+
+fn compare_entries(
+    menu: ContextMenu,
+    reference: SharedString,
+    is_head: bool,
+    compare_selection: Option<SharedString>,
+    repository_id: RepositoryId,
+    repository: WeakEntity<Repository>,
+    workspace: WeakEntity<Workspace>,
+) -> ContextMenu {
+    menu.separator()
+        .entry("Compare with Working Tree", None, {
+            let repository = repository.clone();
+            let workspace = workspace.clone();
+            let reference = reference.clone();
+            move |window, cx| {
+                let Some(repository) = repository.upgrade() else {
+                    return;
+                };
+                workspace
+                    .update(cx, |workspace, cx| {
+                        let project = workspace.project().clone();
+                        BranchDiff::deploy_branch_diff_with_base(
+                            workspace,
+                            project,
+                            repository,
+                            DiffBase::Ref {
+                                base_ref: reference.clone(),
+                            },
+                            None,
+                            window,
+                            cx,
+                        );
+                    })
+                    .ok();
+            }
+        })
+        .item(
+            ContextMenuEntry::new("Compare with HEAD")
+                .disabled(is_head)
+                .handler({
+                    let repository = repository.clone();
+                    let workspace = workspace.clone();
+                    let reference = reference.clone();
+                    move |window, cx| {
+                        CommitView::open_range(
+                            reference.clone(),
+                            "HEAD".into(),
+                            repository.clone(),
+                            workspace.clone(),
+                            window,
+                            cx,
+                        );
+                    }
+                }),
+        )
+        .when_some(
+            compare_selection.filter(|selected| *selected != reference),
+            |menu, selected| {
+                let repository = repository.clone();
+                let workspace = workspace.clone();
+                let reference = reference.clone();
+                menu.entry(
+                    format!("Compare with {}", short_ref(&selected)),
+                    None,
+                    move |window, cx| {
+                        CommitView::open_range(
+                            selected.clone(),
+                            reference.clone(),
+                            repository.clone(),
+                            workspace.clone(),
+                            window,
+                            cx,
+                        );
+                    },
+                )
+            },
+        )
+        .entry("Select for Compare", None, move |_window, cx| {
+            cx.set_global(CompareSelection {
+                repository_id,
+                reference: reference.clone(),
+            });
+        })
 }
 
 fn commit_operation_entries(

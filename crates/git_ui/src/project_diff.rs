@@ -59,6 +59,8 @@ actions!(
         CompareWithBranch,
         /// Compare the working tree directly with a branch, tag, or commit.
         CompareWithRef,
+        /// Compare two branches, tags, or commits with each other.
+        CompareRefs,
     ]
 );
 

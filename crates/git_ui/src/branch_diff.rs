@@ -1,10 +1,11 @@
 use crate::{
     branch_picker,
+    commit_view::CommitView,
     diff_multibuffer::DiffMultibuffer,
     picker_prompt,
     project_diff::{
-        self, CompareWithBranch, CompareWithRef, DeployBranchDiff, ProjectDiff, ReviewDiff,
-        render_send_review_to_agent_button,
+        self, CompareRefs, CompareWithBranch, CompareWithRef, DeployBranchDiff, ProjectDiff,
+        ReviewDiff, render_send_review_to_agent_button,
     },
 };
 use agent_settings::AgentSettings;
@@ -35,6 +36,7 @@ use std::{
     sync::Arc,
 };
 use ui::{DiffStat, Divider, PopoverMenu, Tooltip, prelude::*};
+use util::ResultExt;
 use workspace::{
     ItemHandle, ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
     ToolbarItemView, Workspace,
@@ -80,6 +82,7 @@ impl BranchDiff {
         });
         workspace.register_action(Self::compare_with_branch);
         workspace.register_action(Self::compare_with_ref);
+        workspace.register_action(Self::compare_refs);
         workspace::register_serializable_item::<Self>(cx);
     }
 
@@ -195,6 +198,40 @@ impl BranchDiff {
         });
     }
 
+    /// Resolves to `None` when the picker is dismissed.
+    fn pick_ref(
+        title: &'static str,
+        repository: Entity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Option<SharedString>>> {
+        let tags = repository.update(cx, |repository, _| repository.tags());
+        // The current branch is the likeliest choice, then local branches before remote ones.
+        let mut branches: Vec<_> = repository.read(cx).branch_list.iter().collect();
+        branches.sort_by_key(|branch| (!branch.is_head, branch.is_remote()));
+        let mut refs: Vec<SharedString> = branches
+            .into_iter()
+            .map(|branch| SharedString::from(branch.name().to_string()))
+            .collect();
+        window.spawn(cx, async move |cx| {
+            let tags = tags.await.log_err().and_then(|tags| tags.log_err());
+            refs.extend(tags.unwrap_or_default());
+            let picked = cx
+                .update(|window, cx| picker_prompt::ref_prompt(title, refs, workspace, window, cx))?
+                .await;
+            let Some(picked) = picked else {
+                return Ok(None);
+            };
+            // git reads a leading dash as an option, so a typed `-p` must never reach it.
+            anyhow::ensure!(
+                !picked.starts_with('-'),
+                "{picked} is not a branch, tag, or commit"
+            );
+            Ok(Some(SharedString::from(picked)))
+        })
+    }
+
     fn compare_with_ref(
         workspace: &mut Workspace,
         _: &CompareWithRef,
@@ -212,9 +249,9 @@ impl BranchDiff {
                 .detach_and_notify_err(workspace, window, cx);
             return;
         };
-        let base_ref = picker_prompt::text_prompt(
+        let base_ref = Self::pick_ref(
             "Compare working tree with",
-            "Branch, tag, or commit",
+            repository.clone(),
             workspace.weak_handle(),
             window,
             cx,
@@ -224,17 +261,9 @@ impl BranchDiff {
             .spawn(cx, {
                 let workspace = workspace.clone();
                 async move |cx| {
-                    let Some(base_ref) = base_ref.await.filter(|base_ref| !base_ref.is_empty())
-                    else {
+                    let Some(base_ref) = base_ref.await? else {
                         return Ok(());
                     };
-                    // git reads a leading dash as an option, and the diff-tree check below
-                    // accepts one, so this guard is what keeps `-p` out of `git diff`.
-                    anyhow::ensure!(
-                        !base_ref.starts_with('-'),
-                        "{base_ref} is not a branch, tag, or commit"
-                    );
-                    let base_ref = SharedString::from(base_ref);
                     // The diff list only logs a failed reload, so an unknown revision would
                     // otherwise open a tab that reads as "No changes".
                     repository
@@ -259,6 +288,67 @@ impl BranchDiff {
                             window,
                             cx,
                         );
+                    })?;
+                    anyhow::Ok(())
+                }
+            })
+            .detach_and_notify_err(workspace, window, cx);
+    }
+
+    fn compare_refs(
+        workspace: &mut Workspace,
+        _: &CompareRefs,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(repository) = workspace.project().read(cx).active_repository(cx) else {
+            let workspace = cx.entity().downgrade();
+            window
+                .spawn(cx, async |_cx| {
+                    let result: Result<()> = Err(anyhow!("No active repository"));
+                    result
+                })
+                .detach_and_notify_err(workspace, window, cx);
+            return;
+        };
+        let workspace = workspace.weak_handle();
+        let base = Self::pick_ref(
+            "Compare from",
+            repository.clone(),
+            workspace.clone(),
+            window,
+            cx,
+        );
+        window
+            .spawn(cx, {
+                let workspace = workspace.clone();
+                async move |cx| {
+                    let Some(base) = base.await? else {
+                        return Ok(());
+                    };
+                    let head = cx
+                        .update(|window, cx| {
+                            Self::pick_ref(
+                                "Compare to",
+                                repository.clone(),
+                                workspace.clone(),
+                                window,
+                                cx,
+                            )
+                        })?
+                        .await?;
+                    let Some(head) = head else {
+                        return Ok(());
+                    };
+                    cx.update(|window, cx| {
+                        CommitView::open_range(
+                            base,
+                            head,
+                            repository.downgrade(),
+                            workspace,
+                            window,
+                            cx,
+                        )
                     })?;
                     anyhow::Ok(())
                 }
