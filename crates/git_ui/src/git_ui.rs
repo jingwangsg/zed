@@ -54,6 +54,7 @@ mod git_runtime_diagnostics;
 pub mod multi_diff_view;
 pub mod picker_prompt;
 pub mod project_diff;
+mod reference_picker;
 pub(crate) mod remote_output;
 pub mod repository_selector;
 pub mod solo_diff_view;

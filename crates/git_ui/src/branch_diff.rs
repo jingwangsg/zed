@@ -1,12 +1,11 @@
 use crate::{
     branch_picker,
-    commit_view::CommitView,
     diff_multibuffer::DiffMultibuffer,
-    picker_prompt,
     project_diff::{
-        self, CompareRefs, CompareWithBranch, CompareWithRef, DeployBranchDiff, ProjectDiff,
-        ReviewDiff, render_send_review_to_agent_button,
+        self, CompareHeadWithRef, CompareRefs, CompareWithBranch, CompareWithRef, DeployBranchDiff,
+        ProjectDiff, ReviewDiff, render_send_review_to_agent_button,
     },
+    reference_picker::{self, PickedReference},
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
@@ -14,10 +13,7 @@ use editor::{
     Addon, Editor, EditorEvent, HiddenDiffHunkRenderer, SplittableEditor,
     actions::SendReviewToAgent,
 };
-use git::{
-    repository::DiffType,
-    status::{DiffTreeType, FileStatus},
-};
+use git::{repository::DiffType, status::FileStatus};
 use gpui::{
     Action, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
     SharedString, Subscription, Task, WeakEntity,
@@ -36,7 +32,6 @@ use std::{
     sync::Arc,
 };
 use ui::{DiffStat, Divider, PopoverMenu, Tooltip, prelude::*};
-use util::ResultExt;
 use workspace::{
     ItemHandle, ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
     ToolbarItemView, Workspace,
@@ -82,6 +77,7 @@ impl BranchDiff {
         });
         workspace.register_action(Self::compare_with_branch);
         workspace.register_action(Self::compare_with_ref);
+        workspace.register_action(Self::compare_head_with_ref);
         workspace.register_action(Self::compare_refs);
         workspace::register_serializable_item::<Self>(cx);
     }
@@ -198,106 +194,36 @@ impl BranchDiff {
         });
     }
 
-    /// Resolves to `None` when the picker is dismissed.
-    fn pick_ref(
-        title: &'static str,
-        repository: Entity<Repository>,
-        workspace: WeakEntity<Workspace>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Task<Result<Option<SharedString>>> {
-        let tags = repository.update(cx, |repository, _| repository.tags());
-        // The current branch is the likeliest choice, then local branches before remote ones.
-        let mut branches: Vec<_> = repository.read(cx).branch_list.iter().collect();
-        branches.sort_by_key(|branch| (!branch.is_head, branch.is_remote()));
-        let mut refs: Vec<SharedString> = branches
-            .into_iter()
-            .map(|branch| SharedString::from(branch.name().to_string()))
-            .collect();
-        window.spawn(cx, async move |cx| {
-            let tags = tags.await.log_err().and_then(|tags| tags.log_err());
-            refs.extend(tags.unwrap_or_default());
-            let picked = cx
-                .update(|window, cx| picker_prompt::ref_prompt(title, refs, workspace, window, cx))?
-                .await;
-            let Some(picked) = picked else {
-                return Ok(None);
-            };
-            // git reads a leading dash as an option, so a typed `-p` must never reach it.
-            anyhow::ensure!(
-                !picked.starts_with('-'),
-                "{picked} is not a branch, tag, or commit"
-            );
-            Ok(Some(SharedString::from(picked)))
-        })
-    }
-
     fn compare_with_ref(
         workspace: &mut Workspace,
         _: &CompareWithRef,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        let project = workspace.project().clone();
-        let Some(repository) = project.read(cx).active_repository(cx) else {
-            let workspace = cx.entity().downgrade();
-            window
-                .spawn(cx, async |_cx| {
-                    let result: Result<()> = Err(anyhow!("No active repository"));
-                    result
-                })
-                .detach_and_notify_err(workspace, window, cx);
-            return;
-        };
-        let base_ref = Self::pick_ref(
-            "Compare working tree with",
-            repository.clone(),
-            workspace.weak_handle(),
-            window,
-            cx,
-        );
-        let workspace = workspace.weak_handle();
-        window
-            .spawn(cx, {
-                let workspace = workspace.clone();
-                async move |cx| {
-                    let Some(base_ref) = base_ref.await? else {
-                        return Ok(());
-                    };
-                    // The diff list only logs a failed reload, so an unknown revision would
-                    // otherwise open a tab that reads as "No changes".
-                    repository
-                        .update(cx, |repository, cx| {
-                            repository.diff_tree(
-                                DiffTreeType::Since {
-                                    base: base_ref.clone(),
-                                    head: "HEAD".into(),
-                                },
-                                cx,
-                            )
-                        })
-                        .await?
-                        .with_context(|| format!("{base_ref} is not a branch, tag, or commit"))?;
-                    workspace.update_in(cx, |workspace, window, cx| {
-                        Self::deploy_branch_diff_with_base(
-                            workspace,
-                            project,
-                            repository,
-                            DiffBase::Ref { base_ref },
-                            None,
-                            window,
-                            cx,
-                        );
-                    })?;
-                    anyhow::Ok(())
-                }
-            })
-            .detach_and_notify_err(workspace, window, cx);
+        Self::compare_from(workspace, Some(PickedReference::working_tree()), window, cx);
+    }
+
+    fn compare_head_with_ref(
+        workspace: &mut Workspace,
+        _: &CompareHeadWithRef,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        Self::compare_from(workspace, Some(PickedReference::head()), window, cx);
     }
 
     fn compare_refs(
         workspace: &mut Workspace,
         _: &CompareRefs,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        Self::compare_from(workspace, None, window, cx);
+    }
+
+    fn compare_from(
+        workspace: &mut Workspace,
+        head: Option<PickedReference>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
@@ -311,49 +237,30 @@ impl BranchDiff {
                 .detach_and_notify_err(workspace, window, cx);
             return;
         };
-        let workspace = workspace.weak_handle();
-        let base = Self::pick_ref(
-            "Compare from",
+        let workspace_handle = workspace.weak_handle();
+        let comparison = reference_picker::pick_comparison(
             repository.clone(),
-            workspace.clone(),
+            head,
+            workspace_handle.clone(),
             window,
             cx,
         );
         window
-            .spawn(cx, {
-                let workspace = workspace.clone();
-                async move |cx| {
-                    let Some(base) = base.await? else {
-                        return Ok(());
-                    };
-                    let head = cx
-                        .update(|window, cx| {
-                            Self::pick_ref(
-                                "Compare to",
-                                repository.clone(),
-                                workspace.clone(),
-                                window,
-                                cx,
-                            )
-                        })?
-                        .await?;
-                    let Some(head) = head else {
-                        return Ok(());
-                    };
-                    cx.update(|window, cx| {
-                        CommitView::open_range(
-                            base,
-                            head,
-                            repository.downgrade(),
-                            workspace,
-                            window,
-                            cx,
-                        )
-                    })?;
-                    anyhow::Ok(())
-                }
+            .spawn(cx, async move |cx| {
+                let Some(comparison) = comparison.await? else {
+                    return Ok(());
+                };
+                cx.update(|window, cx| {
+                    reference_picker::open_comparison(
+                        comparison,
+                        repository,
+                        workspace_handle,
+                        window,
+                        cx,
+                    )
+                })?
             })
-            .detach_and_notify_err(workspace, window, cx);
+            .detach_and_notify_err(workspace.weak_handle(), window, cx);
     }
 
     pub(crate) fn deploy_branch_diff_with_base(

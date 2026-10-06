@@ -16,7 +16,7 @@ use git::{
         FileRevisionNeighbors, FileRevisionStats, GRAPH_CHUNK_SIZE, GitRepository,
         GitRepositoryCheckpoint, InProgressOperation, InProgressOperationAction,
         InitialGraphCommitData, LogOrder, LogSource, MergeKind, PushOptions, RefEdit, Remote,
-        RepoPath, ResetMode, SearchCommitArgs, Worktree, commit_hash_search_query,
+        RepoPath, ResetMode, SearchCommitArgs, Tag, Worktree, commit_hash_search_query,
     },
     stash::GitStash,
     status::{
@@ -1733,15 +1733,31 @@ impl GitRepository for FakeGitRepository {
         }))
     }
 
-    fn tags(&self) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+    fn tags(&self) -> BoxFuture<'_, Result<Vec<Tag>>> {
         self.with_state_async(false, |state| {
-            let mut tags: Vec<SharedString> = state
+            let mut tags: Vec<Tag> = state
                 .refs
-                .keys()
-                .filter_map(|ref_name| ref_name.strip_prefix("refs/tags/"))
-                .map(|tag| SharedString::from(tag.to_string()))
+                .iter()
+                .filter_map(|(ref_name, sha)| {
+                    let name = ref_name.strip_prefix("refs/tags/")?;
+                    let sha: Oid = sha.parse().ok()?;
+                    let commit_timestamp = match state.commit_data.get(&sha) {
+                        Some(FakeCommitDataEntry::Success(commit)) => commit.commit_timestamp,
+                        _ => 0,
+                    };
+                    Some(Tag {
+                        name: SharedString::from(name.to_string()),
+                        sha,
+                        commit_timestamp,
+                    })
+                })
                 .collect();
-            tags.sort();
+            tags.sort_by(|left, right| {
+                right
+                    .commit_timestamp
+                    .cmp(&left.commit_timestamp)
+                    .then_with(|| left.name.cmp(&right.name))
+            });
             Ok(tags)
         })
     }

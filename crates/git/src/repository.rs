@@ -968,6 +968,15 @@ pub struct Contributor {
     pub commit_count: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tag {
+    pub name: SharedString,
+    /// The commit the tag points at; annotated tags are peeled.
+    pub sha: Oid,
+    /// Unix timestamp of the tag for annotated tags, of the commit otherwise.
+    pub commit_timestamp: i64,
+}
+
 /// The commits that changed a file right before and right after a given revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRevisionNeighbors {
@@ -1405,8 +1414,8 @@ pub trait GitRepository: Send + Sync {
     /// Every commit that changed the file, newest first, with the lines it changed.
     fn file_history_stats(&self, path: RepoPath) -> BoxFuture<'_, Result<Vec<FileRevisionStats>>>;
 
-    /// Tag names.
-    fn tags(&self) -> BoxFuture<'_, Result<Vec<SharedString>>>;
+    /// Tags, newest first.
+    fn tags(&self) -> BoxFuture<'_, Result<Vec<Tag>>>;
 
     /// The files that differ between two revisions, with both sides' contents.
     fn load_range_diff(&self, base: String, head: String) -> BoxFuture<'_, Result<CommitDiff>>;
@@ -3218,22 +3227,35 @@ impl GitRepository for RealGitRepository {
         .boxed()
     }
 
-    fn tags(&self) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+    fn tags(&self) -> BoxFuture<'_, Result<Vec<Tag>>> {
         let git = self.git_binary();
         self.executor
             .spawn(async move {
                 let output = git
                     .run(&[
                         "for-each-ref",
-                        "--format=%(refname:short)",
+                        "--format=%(refname:short)%00%(objectname)%00%(*objectname)%00%(creatordate:unix)",
                         "--sort=-creatordate",
                         "refs/tags",
                     ])
                     .await?;
                 Ok(output
                     .lines()
-                    .filter(|line| !line.is_empty())
-                    .map(|line| SharedString::from(line.to_string()))
+                    .filter_map(|line| {
+                        let mut fields = line.split('\0');
+                        let name = fields.next()?;
+                        let object = fields.next()?;
+                        let peeled = fields.next()?;
+                        let timestamp = fields.next()?;
+                        // `*objectname` is only set for annotated tags, where it names the
+                        // tagged commit.
+                        let sha = if peeled.is_empty() { object } else { peeled };
+                        Some(Tag {
+                            name: SharedString::from(name.to_string()),
+                            sha: sha.parse().ok()?,
+                            commit_timestamp: timestamp.parse().ok()?,
+                        })
+                    })
                     .collect())
             })
             .boxed()
@@ -5484,11 +5506,17 @@ mod tests {
             RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
                 .unwrap();
 
+        let head: Oid = git_command_output(path, ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
         let mut tags = repository.tags().await.unwrap();
-        tags.sort();
-        assert_eq!(
-            tags,
-            vec![SharedString::from("v1"), SharedString::from("v2")]
+        tags.sort_by(|left, right| left.name.cmp(&right.name));
+        let names: Vec<_> = tags.iter().map(|tag| tag.name.as_ref()).collect();
+        assert_eq!(names, vec!["v1", "v2"]);
+        // The annotated `v2` is peeled to the commit it tags.
+        assert!(
+            tags.iter()
+                .all(|tag| tag.sha == head && tag.commit_timestamp > 0)
         );
     }
 

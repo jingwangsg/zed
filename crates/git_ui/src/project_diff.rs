@@ -61,6 +61,8 @@ actions!(
         CompareWithRef,
         /// Compare two branches, tags, or commits with each other.
         CompareRefs,
+        /// Compare HEAD with a branch, tag, or commit.
+        CompareHeadWithRef,
     ]
 );
 

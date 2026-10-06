@@ -1,14 +1,15 @@
 use crate::branch_diff::BranchDiff;
-use crate::commit_view::{CommitView, short_ref};
+use crate::commit_view::CommitView;
 use crate::picker_prompt::text_prompt;
+use crate::reference_picker::{self, Comparison, PickedReference, ReferenceKind};
 use crate::report_git_operation;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use futures::channel::oneshot;
 use git::Oid;
 use git::repository::{MergeKind, RepoPath, ResetMode};
 use gpui::{
-    Action, ClipboardItem, Context, Entity, FocusHandle, Global, PromptLevel, SharedString,
-    WeakEntity, Window, actions,
+    Action, App, ClipboardItem, Context, Entity, FocusHandle, Global, PromptLevel, SharedString,
+    Task, WeakEntity, Window, actions,
 };
 use project::{
     GIT_COMMAND_TASK_TAG,
@@ -18,6 +19,7 @@ use project::{
 use task::{TaskContext, TaskVariables, VariableName};
 use ui::{Color, ContextMenu, ContextMenuEntry, IconName, IconPosition, prelude::*};
 use workspace::Workspace;
+use workspace::notifications::NotifyTaskExt;
 
 actions!(
     git_graph,
@@ -46,7 +48,7 @@ pub(crate) struct CommitContextMenuData {
 /// comparison from any commit or ref menu of the same repository.
 struct CompareSelection {
     repository_id: RepositoryId,
-    reference: SharedString,
+    reference: PickedReference,
 }
 
 impl Global for CompareSelection {}
@@ -264,11 +266,22 @@ pub(crate) fn commit_context_menu(
                 repository.clone().zip(repository_id),
                 |menu, (repository, repository_id)| {
                     let (reference, is_head) = match &ref_target {
-                        None => (SharedString::from(sha.to_string()), is_head_commit),
-                        Some((ref_name, ref_kind)) => (
-                            ref_name.clone(),
-                            matches!(ref_kind, RefKind::LocalBranch { is_head: true }),
-                        ),
+                        None => (PickedReference::revision(sha.to_string()), is_head_commit),
+                        Some((ref_name, ref_kind)) => {
+                            let kind = match ref_kind {
+                                RefKind::LocalBranch { .. } => ReferenceKind::LocalBranch,
+                                RefKind::RemoteBranch => ReferenceKind::RemoteBranch,
+                                RefKind::Tag => ReferenceKind::Tag,
+                                RefKind::Unknown => ReferenceKind::Revision,
+                            };
+                            (
+                                PickedReference {
+                                    kind,
+                                    name: ref_name.clone(),
+                                },
+                                matches!(ref_kind, RefKind::LocalBranch { is_head: true }),
+                            )
+                        }
                     };
                     compare_entries(
                         menu,
@@ -321,41 +334,121 @@ pub(crate) fn commit_context_menu(
     })
 }
 
+fn open_comparison_or_notify(
+    comparison: Comparison,
+    repository: &WeakEntity<Repository>,
+    workspace: &WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(repository) = repository.upgrade() else {
+        return;
+    };
+    Task::ready(reference_picker::open_comparison(
+        comparison,
+        repository,
+        workspace.clone(),
+        window,
+        cx,
+    ))
+    .detach_and_notify_err(workspace.clone(), window, cx);
+}
+
+/// The newer commit becomes the side being compared so the diff reads forward in time.
+/// GitLens orders the two by ancestry and then by date; the dates alone are what this
+/// repository can tell cheaply, and they agree whenever the commits are related.
+fn compare_with_head(
+    reference: PickedReference,
+    repository: Entity<Repository>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<Result<()>> {
+    let (reference_details, head_details) = repository.update(cx, |repository, _| {
+        (
+            repository.show(reference.name.to_string()),
+            repository.show("HEAD".to_string()),
+        )
+    });
+    window.spawn(cx, async move |cx| {
+        let (reference_details, head_details) = futures::join!(reference_details, head_details);
+        let reference_details = reference_details.context("the commit load was cancelled")??;
+        let head_details = head_details.context("the commit load was cancelled")??;
+        let comparison = if reference_details.commit_timestamp > head_details.commit_timestamp {
+            Comparison {
+                head: reference,
+                base: PickedReference::head(),
+            }
+        } else {
+            Comparison {
+                head: PickedReference::head(),
+                base: reference,
+            }
+        };
+        cx.update(|window, cx| {
+            reference_picker::open_comparison(comparison, repository, workspace, window, cx)
+        })?
+    })
+}
+
 fn compare_entries(
     menu: ContextMenu,
-    reference: SharedString,
+    reference: PickedReference,
     is_head: bool,
-    compare_selection: Option<SharedString>,
+    compare_selection: Option<PickedReference>,
     repository_id: RepositoryId,
     repository: WeakEntity<Repository>,
     workspace: WeakEntity<Workspace>,
 ) -> ContextMenu {
+    let is_branch = matches!(
+        reference.kind,
+        ReferenceKind::LocalBranch | ReferenceKind::RemoteBranch
+    );
     menu.separator()
         .entry("Compare with Working Tree", None, {
             let repository = repository.clone();
             let workspace = workspace.clone();
             let reference = reference.clone();
             move |window, cx| {
-                let Some(repository) = repository.upgrade() else {
-                    return;
-                };
-                workspace
-                    .update(cx, |workspace, cx| {
-                        let project = workspace.project().clone();
-                        BranchDiff::deploy_branch_diff_with_base(
-                            workspace,
-                            project,
-                            repository,
-                            DiffBase::Ref {
-                                base_ref: reference.clone(),
-                            },
-                            None,
-                            window,
-                            cx,
-                        );
-                    })
-                    .ok();
+                open_comparison_or_notify(
+                    Comparison {
+                        head: PickedReference::working_tree(),
+                        base: reference.clone(),
+                    },
+                    &repository,
+                    &workspace,
+                    window,
+                    cx,
+                );
             }
+        })
+        .when(is_branch, |menu| {
+            menu.entry("Compare Ancestry with Working Tree", None, {
+                let repository = repository.clone();
+                let workspace = workspace.clone();
+                let reference = reference.clone();
+                move |window, cx| {
+                    let Some(repository) = repository.upgrade() else {
+                        return;
+                    };
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            let project = workspace.project().clone();
+                            BranchDiff::deploy_branch_diff_with_base(
+                                workspace,
+                                project,
+                                repository,
+                                DiffBase::Merge {
+                                    base_ref: reference.name.clone(),
+                                },
+                                None,
+                                window,
+                                cx,
+                            );
+                        })
+                        .ok();
+                }
+            })
         })
         .item(
             ContextMenuEntry::new("Compare with HEAD")
@@ -365,10 +458,17 @@ fn compare_entries(
                     let workspace = workspace.clone();
                     let reference = reference.clone();
                     move |window, cx| {
-                        CommitView::open_range(
+                        let Some(repository) = repository.upgrade() else {
+                            return;
+                        };
+                        compare_with_head(
                             reference.clone(),
-                            "HEAD".into(),
-                            repository.clone(),
+                            repository,
+                            workspace.clone(),
+                            window,
+                            cx,
+                        )
+                        .detach_and_notify_err(
                             workspace.clone(),
                             window,
                             cx,
@@ -377,20 +477,24 @@ fn compare_entries(
                 }),
         )
         .when_some(
-            compare_selection.filter(|selected| *selected != reference),
+            compare_selection.filter(|selected| selected.name != reference.name),
             |menu, selected| {
                 let repository = repository.clone();
                 let workspace = workspace.clone();
                 let reference = reference.clone();
                 menu.entry(
-                    format!("Compare with {}", short_ref(&selected)),
+                    format!("Compare with {}", selected.label()),
                     None,
                     move |window, cx| {
-                        CommitView::open_range(
-                            selected.clone(),
-                            reference.clone(),
-                            repository.clone(),
-                            workspace.clone(),
+                        // GitLens compares the selection with the clicked ref, selection
+                        // first, so the diff runs from here to the selection.
+                        open_comparison_or_notify(
+                            Comparison {
+                                head: selected.clone(),
+                                base: reference.clone(),
+                            },
+                            &repository,
+                            &workspace,
                             window,
                             cx,
                         );

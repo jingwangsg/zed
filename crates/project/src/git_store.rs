@@ -41,7 +41,7 @@ use git::{
         FileHistoryChangedFileSets, FileRevisionNeighbors, FileRevisionStats, GitCommitTemplate,
         GitRepository, GitRepositoryCheckpoint, InProgressOperation, InProgressOperationAction,
         InitialGraphCommitData, LogOrder, LogSource, MergeKind, PushOptions, Remote,
-        RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus,
+        RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs, Tag, UpstreamTrackingStatus,
         Worktree as GitWorktree, delete_branch_flag, is_binary_content,
     },
     stash::{GitStash, StashEntry},
@@ -4113,7 +4113,14 @@ impl GitStore {
             .update(&mut cx, |repository_handle, _| repository_handle.tags())
             .await??;
         Ok(proto::GitTagsResponse {
-            tags: tags.into_iter().map(|tag| tag.to_string()).collect(),
+            tags: tags
+                .into_iter()
+                .map(|tag| proto::GitTag {
+                    name: tag.name.to_string(),
+                    sha: tag.sha.to_string(),
+                    commit_timestamp: tag.commit_timestamp,
+                })
+                .collect(),
         })
     }
 
@@ -9832,7 +9839,7 @@ impl Repository {
         )
     }
 
-    pub fn tags(&mut self) -> oneshot::Receiver<Result<Vec<SharedString>>> {
+    pub fn tags(&mut self) -> oneshot::Receiver<Result<Vec<Tag>>> {
         let id = self.id;
         self.send_read_job("tags", None, move |repo, _cx| async move {
             match repo {
@@ -9846,7 +9853,17 @@ impl Repository {
                             repository_id: id.to_proto(),
                         })
                         .await?;
-                    Ok(response.tags.into_iter().map(SharedString::from).collect())
+                    response
+                        .tags
+                        .into_iter()
+                        .map(|tag| {
+                            Ok(Tag {
+                                name: tag.name.into(),
+                                sha: Oid::from_str(&tag.sha)?,
+                                commit_timestamp: tag.commit_timestamp,
+                            })
+                        })
+                        .collect()
                 }
             }
         })

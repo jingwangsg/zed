@@ -764,7 +764,14 @@ message GitTags {
 }
 
 message GitTagsResponse {
-  repeated string tags = 1;
+  reserved 1;
+  repeated GitTag tags = 2;
+}
+
+message GitTag {
+  string name = 1;
+  string sha = 2;
+  int64 commit_timestamp = 3;
 }
 
 message LoadRangeDiff {
