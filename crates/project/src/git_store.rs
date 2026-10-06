@@ -690,6 +690,11 @@ pub struct Repository {
     paths_needing_status_update: Vec<Vec<RepoPath>>,
     job_sender: mpsc::UnboundedSender<GitJob>,
     _worker_task: Task<()>,
+    read_job_sender: mpsc::UnboundedSender<GitJob>,
+    _read_worker_task: Task<()>,
+    // Serial-lane jobs that change the repository and have not finished yet. A read
+    // submitted while this is non-zero joins the serial lane so it observes them.
+    pending_mutations: usize,
     active_jobs: HashMap<JobId, JobInfo>,
     job_debug_queue: job_debug_queue::GitJobDebugQueue,
     pending_ops: SumTree<PendingOps>,
@@ -873,6 +878,13 @@ pub struct GitJob {
     id: JobId,
     job: Box<dyn FnOnce(RepositoryState, &mut AsyncApp) -> Task<()>>,
     key: Option<GitJobKey>,
+    counts_as_mutation: bool,
+}
+
+#[derive(Clone, Copy)]
+enum JobLane {
+    Serial { mutates: bool },
+    Read,
 }
 
 #[derive(PartialEq, Eq)]
@@ -2362,7 +2374,7 @@ impl GitStore {
             .to_string();
 
         let rx = repo.update(cx, |repo, _| {
-            repo.send_job("get_permalink", None, move |state, cx| async move {
+            repo.send_read_job("get_permalink", None, move |state, cx| async move {
                 match state {
                     RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                         let origin_url = backend
@@ -6751,7 +6763,9 @@ impl Repository {
             })
             .shared();
         self.job_sender.close_channel();
+        self.read_job_sender.close_channel();
         self._worker_task = Task::ready(());
+        self.pending_mutations = 0;
         self.active_jobs.clear();
         self.job_debug_queue
             .mark_unfinished_complete(job_debug_queue::CompletedJobStatus::Skipped);
@@ -6766,6 +6780,10 @@ impl Repository {
                 Ok(RepositoryState::Local(state))
             })
             .shared();
+        let (read_job_sender, read_worker_task) =
+            Self::spawn_read_worker(self.repository_state.clone(), cx);
+        self.read_job_sender = read_job_sender;
+        self._read_worker_task = read_worker_task;
     }
 
     fn reinitialize_local_backend(
@@ -6820,6 +6838,9 @@ impl Repository {
             paths_needing_status_update: Default::default(),
             latest_askpass_id: 0,
             job_sender: mpsc::unbounded().0,
+            read_job_sender: mpsc::unbounded().0,
+            _read_worker_task: Task::ready(()),
+            pending_mutations: 0,
             job_id: 0,
             active_jobs: Default::default(),
             job_debug_queue: job_debug_queue::GitJobDebugQueue::new(),
@@ -6855,6 +6876,8 @@ impl Repository {
         let repository_state = RemoteRepositoryState { project_id, client };
         let (job_sender, worker_task) = Self::spawn_remote_git_worker(repository_state.clone(), cx);
         let repository_state = Task::ready(Ok(RepositoryState::Remote(repository_state))).shared();
+        let (read_job_sender, read_worker_task) =
+            Self::spawn_read_worker(repository_state.clone(), cx);
         cx.subscribe_self(Self::handle_subscribe_self).detach();
 
         Self {
@@ -6867,6 +6890,9 @@ impl Repository {
             paths_needing_status_update: Default::default(),
             job_sender,
             _worker_task: worker_task,
+            read_job_sender,
+            _read_worker_task: read_worker_task,
+            pending_mutations: 0,
             repository_state,
             askpass_delegates: Default::default(),
             latest_askpass_id: 0,
@@ -7104,7 +7130,13 @@ impl Repository {
         Fut: Future<Output = R> + 'static,
         R: Send + 'static,
     {
-        self.send_keyed_job(description, None, status, job)
+        self.enqueue_job(
+            description,
+            None,
+            status,
+            JobLane::Serial { mutates: true },
+            job,
+        )
     }
 
     fn send_keyed_job<F, Fut, R>(
@@ -7119,6 +7151,45 @@ impl Repository {
         Fut: Future<Output = R> + 'static,
         R: Send + 'static,
     {
+        // Among keyed jobs only index writes change the repository; the rest are status
+        // scans and diff-base reloads that later reads need not wait for.
+        let mutates = matches!(key, Some(GitJobKey::WriteIndex(_)));
+        self.enqueue_job(description, key, status, JobLane::Serial { mutates }, job)
+    }
+
+    /// Runs a job that only reads the repository. Reads start right away and run
+    /// concurrently with each other and with status scans, so a slow `git status` on a
+    /// large or network-mounted checkout does not hold up `show`, diffs, or blame. A read
+    /// submitted while a mutation is still pending joins the serial lane behind it, so it
+    /// still observes that mutation. Ordering is one-directional: a read already in flight
+    /// does not delay a mutation submitted after it.
+    pub fn send_read_job<F, Fut, R>(
+        &mut self,
+        description: &'static str,
+        status: Option<SharedString>,
+        job: F,
+    ) -> oneshot::Receiver<R>
+    where
+        F: FnOnce(RepositoryState, AsyncApp) -> Fut + 'static,
+        Fut: Future<Output = R> + 'static,
+        R: Send + 'static,
+    {
+        self.enqueue_job(description, None, status, JobLane::Read, job)
+    }
+
+    fn enqueue_job<F, Fut, R>(
+        &mut self,
+        description: &'static str,
+        key: Option<GitJobKey>,
+        status: Option<SharedString>,
+        lane: JobLane,
+        job: F,
+    ) -> oneshot::Receiver<R>
+    where
+        F: FnOnce(RepositoryState, AsyncApp) -> Fut + 'static,
+        Fut: Future<Output = R> + 'static,
+        R: Send + 'static,
+    {
         let (result_tx, result_rx) = futures::channel::oneshot::channel();
         let job_id = post_inc(&mut self.job_id);
         let this = self.this.clone();
@@ -7126,45 +7197,59 @@ impl Repository {
         let key_label = key.as_ref().map(format_job_key);
         self.job_debug_queue.add(job_id, description, key_label);
 
-        self.job_sender
-            .unbounded_send(GitJob {
-                id: job_id,
-                key,
-                job: Box::new(move |state, cx: &mut AsyncApp| {
-                    let job = job(state, cx.clone());
-                    cx.spawn(async move |cx| {
-                        this.update(cx, |this, cx| {
-                            this.job_debug_queue.mark_running(job_id);
-                            if let Some(s) = status {
-                                this.active_jobs.insert(
-                                    job_id,
-                                    JobInfo {
-                                        start: Instant::now(),
-                                        message: s,
-                                    },
-                                );
-                            }
-                            cx.notify();
-                        })
-                        .ok();
+        let use_read_lane = matches!(lane, JobLane::Read) && self.pending_mutations == 0;
+        let counts_as_mutation = matches!(lane, JobLane::Serial { mutates: true });
+        if counts_as_mutation {
+            self.pending_mutations += 1;
+        }
 
-                        let result = job.await;
-
-                        this.update(cx, |this, cx| {
-                            this.job_debug_queue.mark_complete(
+        let git_job = GitJob {
+            id: job_id,
+            key,
+            counts_as_mutation,
+            job: Box::new(move |state, cx: &mut AsyncApp| {
+                let job = job(state, cx.clone());
+                cx.spawn(async move |cx| {
+                    this.update(cx, |this, cx| {
+                        this.job_debug_queue.mark_running(job_id);
+                        if let Some(s) = status {
+                            this.active_jobs.insert(
                                 job_id,
-                                job_debug_queue::CompletedJobStatus::Finished,
+                                JobInfo {
+                                    start: Instant::now(),
+                                    message: s,
+                                },
                             );
-                            this.active_jobs.remove(&job_id);
-                            cx.notify();
-                        })
-                        .ok();
-
-                        result_tx.send(result).ok();
+                        }
+                        cx.notify();
                     })
-                }),
-            })
-            .ok();
+                    .ok();
+
+                    let result = job.await;
+
+                    this.update(cx, |this, cx| {
+                        this.job_debug_queue
+                            .mark_complete(job_id, job_debug_queue::CompletedJobStatus::Finished);
+                        this.active_jobs.remove(&job_id);
+                        if counts_as_mutation {
+                            // load-bearing: an underflow would wrap and send every later
+                            // read down the serial lane.
+                            this.pending_mutations = this.pending_mutations.saturating_sub(1);
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+
+                    result_tx.send(result).ok();
+                })
+            }),
+        };
+        let sender = if use_read_lane {
+            &self.read_job_sender
+        } else {
+            &self.job_sender
+        };
+        sender.unbounded_send(git_job).ok();
         result_rx
     }
 
@@ -7427,7 +7512,7 @@ impl Repository {
 
     pub fn show(&mut self, commit: String) -> oneshot::Receiver<Result<CommitDetails>> {
         let id = self.id;
-        self.send_job("show", None, move |git_repo, _cx| async move {
+        self.send_read_job("show", None, move |git_repo, _cx| async move {
             match git_repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     backend.show(commit).await
@@ -7459,7 +7544,7 @@ impl Repository {
         ignore_shallow_boundary: bool,
     ) -> oneshot::Receiver<Result<CommitDiff>> {
         let id = self.id;
-        self.send_job("load_commit_diff", None, move |git_repo, cx| async move {
+        self.send_read_job("load_commit_diff", None, move |git_repo, cx| async move {
             match git_repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => backend
                     .load_commit(commit, ignore_shallow_boundary, cx)
@@ -7501,7 +7586,7 @@ impl Repository {
         paths: Vec<RepoPath>,
         commit_limit: usize,
     ) -> oneshot::Receiver<Result<Vec<FileHistoryChangedFileSets>>> {
-        self.send_job(
+        self.send_read_job(
             "file_history_changed_files",
             None,
             move |git_repo, _cx| async move {
@@ -9304,7 +9389,7 @@ impl Repository {
         is_push: bool,
     ) -> oneshot::Receiver<Result<Vec<Remote>>> {
         let id = self.id;
-        self.send_job("get_remotes", None, move |repo, _cx| async move {
+        self.send_read_job("get_remotes", None, move |repo, _cx| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     let remote = if let Some(branch_name) = branch_name {
@@ -9348,7 +9433,7 @@ impl Repository {
 
     pub fn remote_urls(&mut self) -> oneshot::Receiver<Result<HashMap<String, String>>> {
         let id = self.id;
-        self.send_job("remote_urls", None, move |repo, _cx| async move {
+        self.send_read_job("remote_urls", None, move |repo, _cx| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     Ok(backend.remote_urls().await)
@@ -9375,7 +9460,7 @@ impl Repository {
 
     pub fn branches(&mut self) -> oneshot::Receiver<Result<BranchesScanResult>> {
         let id = self.id;
-        self.send_job("branches", None, move |repo, _| async move {
+        self.send_read_job("branches", None, move |repo, _| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     backend.branches().await
@@ -9441,7 +9526,7 @@ impl Repository {
 
     pub fn worktrees(&mut self) -> oneshot::Receiver<Result<Vec<GitWorktree>>> {
         let id = self.id;
-        self.send_job("worktrees", None, move |repo, _| async move {
+        self.send_read_job("worktrees", None, move |repo, _| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     backend.worktrees().await
@@ -9523,7 +9608,7 @@ impl Repository {
         worktree_path: PathBuf,
     ) -> oneshot::Receiver<Result<Option<SystemTime>>> {
         let id = self.id;
-        self.send_job("worktree_created_at", None, move |repo, _cx| async move {
+        self.send_read_job("worktree_created_at", None, move |repo, _cx| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     backend.worktree_created_at(worktree_path).await
@@ -9589,7 +9674,7 @@ impl Repository {
 
     pub fn revparse(&mut self, revision: String) -> oneshot::Receiver<Result<Option<Oid>>> {
         let id = self.id;
-        self.send_job("revparse", None, move |repo, _cx| async move {
+        self.send_read_job("revparse", None, move |repo, _cx| async move {
             let sha = match repo {
                 // Peeling resolves an annotated tag to the commit it names, and turns
                 // trees and blobs into a missing object, which reads as an unknown revision.
@@ -9616,7 +9701,7 @@ impl Repository {
 
     pub fn contributors(&mut self) -> oneshot::Receiver<Result<Vec<Contributor>>> {
         let id = self.id;
-        self.send_job("contributors", None, move |repo, _cx| async move {
+        self.send_read_job("contributors", None, move |repo, _cx| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     backend.contributors().await
@@ -9648,7 +9733,7 @@ impl Repository {
         revision: Oid,
     ) -> oneshot::Receiver<Result<FileRevisionNeighbors>> {
         let id = self.id;
-        self.send_job(
+        self.send_read_job(
             "file_revision_neighbors",
             None,
             move |repo, _cx| async move {
@@ -9683,7 +9768,7 @@ impl Repository {
         path: RepoPath,
     ) -> oneshot::Receiver<Result<Vec<FileRevisionStats>>> {
         let id = self.id;
-        self.send_job("file_history_stats", None, move |repo, _cx| async move {
+        self.send_read_job("file_history_stats", None, move |repo, _cx| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     backend.file_history_stats(path).await
@@ -9716,7 +9801,7 @@ impl Repository {
 
     pub fn head_sha(&mut self) -> oneshot::Receiver<Result<Option<String>>> {
         let id = self.id;
-        self.send_job("head_sha", None, move |repo, _cx| async move {
+        self.send_read_job("head_sha", None, move |repo, _cx| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     Ok(backend.head_sha().await)
@@ -9974,7 +10059,7 @@ impl Repository {
         include_remote_name: bool,
     ) -> oneshot::Receiver<Result<Option<SharedString>>> {
         let id = self.id;
-        self.send_job("default_branch", None, move |repo, _| async move {
+        self.send_read_job("default_branch", None, move |repo, _| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     backend.default_branch(include_remote_name).await
@@ -10000,7 +10085,7 @@ impl Repository {
         _cx: &App,
     ) -> oneshot::Receiver<Result<TreeDiff>> {
         let repository_id = self.snapshot.id;
-        self.send_job("diff_tree", None, move |repo, _cx| async move {
+        self.send_read_job("diff_tree", None, move |repo, _cx| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     backend.diff_tree(diff_type).await
@@ -10071,7 +10156,7 @@ impl Repository {
 
     pub fn diff(&mut self, diff_type: DiffType, _cx: &App) -> oneshot::Receiver<Result<String>> {
         let id = self.id;
-        self.send_job("diff", None, move |repo, _cx| async move {
+        self.send_read_job("diff", None, move |repo, _cx| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     backend.diff(diff_type).await
@@ -10520,7 +10605,7 @@ impl Repository {
 
     pub fn check_for_pushed_commits(&mut self) -> oneshot::Receiver<Result<Vec<SharedString>>> {
         let id = self.id;
-        self.send_job(
+        self.send_read_job(
             "check_for_pushed_commits",
             None,
             move |repo, _cx| async move {
@@ -10705,7 +10790,7 @@ impl Repository {
         right: GitRepositoryCheckpoint,
     ) -> oneshot::Receiver<Result<bool>> {
         let id = self.id;
-        self.send_job("compare_checkpoints", None, move |repo, _cx| async move {
+        self.send_read_job("compare_checkpoints", None, move |repo, _cx| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     backend.compare_checkpoints(left, right).await
@@ -10731,7 +10816,7 @@ impl Repository {
         target_checkpoint: GitRepositoryCheckpoint,
     ) -> oneshot::Receiver<Result<String>> {
         let id = self.id;
-        self.send_job("diff_checkpoints", None, move |repo, _cx| async move {
+        self.send_read_job("diff_checkpoints", None, move |repo, _cx| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     backend
@@ -10812,6 +10897,25 @@ impl Repository {
         );
     }
 
+    fn spawn_read_worker(
+        state: Shared<Task<Result<RepositoryState, String>>>,
+        cx: &mut Context<Self>,
+    ) -> (mpsc::UnboundedSender<GitJob>, Task<()>) {
+        let (job_tx, mut job_rx) = mpsc::unbounded::<GitJob>();
+
+        let worker_task = cx.spawn(async move |_, cx| {
+            let Some(state) = state.await.log_err() else {
+                return;
+            };
+            while let Some(job) = job_rx.next().await {
+                // Each read gets its own task so one slow `git log` does not delay the others.
+                (job.job)(state.clone(), cx).detach();
+            }
+        });
+
+        (job_tx, worker_task)
+    }
+
     fn spawn_local_git_worker(
         state: Shared<Task<Result<LocalRepositoryState, String>>>,
         cx: &mut Context<Self>,
@@ -10845,11 +10949,15 @@ impl Repository {
                             .any(|other_job| other_job.key.as_ref() == Some(current_key))
                     {
                         let skipped_job_id = job.id;
+                        let counts_as_mutation = job.counts_as_mutation;
                         this.update(cx, |repo, _| {
                             repo.job_debug_queue.mark_complete(
                                 skipped_job_id,
                                 job_debug_queue::CompletedJobStatus::Skipped,
                             );
+                            if counts_as_mutation {
+                                repo.pending_mutations = repo.pending_mutations.saturating_sub(1);
+                            }
                         })
                         .ok();
                         continue;
@@ -10888,11 +10996,16 @@ impl Repository {
                                 .any(|other_job| other_job.key.as_ref() == Some(current_key))
                         {
                             let skipped_job_id = job.id;
+                            let counts_as_mutation = job.counts_as_mutation;
                             this.update(cx, |repo, _| {
                                 repo.job_debug_queue.mark_complete(
                                     skipped_job_id,
                                     job_debug_queue::CompletedJobStatus::Skipped,
                                 );
+                                if counts_as_mutation {
+                                    repo.pending_mutations =
+                                        repo.pending_mutations.saturating_sub(1);
+                                }
                             })
                             .ok();
                             continue;
@@ -10919,7 +11032,7 @@ impl Repository {
         repo_path: RepoPath,
         cx: &App,
     ) -> Task<Result<Option<String>>> {
-        let rx = self.send_job("load_staged_text", None, move |state, _| async move {
+        let rx = self.send_read_job("load_staged_text", None, move |state, _| async move {
             match state {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => backend
                     .load_index_text(repo_path)
@@ -10946,7 +11059,7 @@ impl Repository {
         repo_path: RepoPath,
         cx: &App,
     ) -> Task<Result<DiffBasesChange>> {
-        let rx = self.send_job("load_committed_text", None, move |state, _| async move {
+        let rx = self.send_read_job("load_committed_text", None, move |state, _| async move {
             match state {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     let revisions = vec![
@@ -11003,7 +11116,7 @@ impl Repository {
         &mut self,
     ) -> oneshot::Receiver<Result<Option<GitCommitTemplate>>> {
         let repository_id = self.snapshot.id;
-        self.send_job(
+        self.send_read_job(
             "load_commit_template_text",
             None,
             move |git_repo, _cx| async move {
@@ -11034,7 +11147,7 @@ impl Repository {
         cx: &App,
     ) -> Task<Result<(String, git::blame::Blame)>> {
         let repository_id = self.snapshot.id;
-        let rx = self.send_job("blame_buffer_at_revision", None, {
+        let rx = self.send_read_job("blame_buffer_at_revision", None, {
             let path = path.clone();
             move |state, _| async move {
                 match state {
@@ -11084,7 +11197,7 @@ impl Repository {
 
     fn load_blob_content(&mut self, oid: Oid, cx: &App) -> Task<Result<String>> {
         let repository_id = self.snapshot.id;
-        let rx = self.send_job("load_blob_content", None, move |state, _| async move {
+        let rx = self.send_read_job("load_blob_content", None, move |state, _| async move {
             match state {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     decode_git_text(backend.load_blob_content(oid).await?)
@@ -11261,7 +11374,13 @@ impl Repository {
     }
 
     pub fn barrier(&mut self) -> oneshot::Receiver<()> {
-        self.send_job("barrier", None, |_, _| async {})
+        self.enqueue_job(
+            "barrier",
+            None,
+            None,
+            JobLane::Serial { mutates: false },
+            |_, _| async {},
+        )
     }
 
     fn spawn_job_with_tracking<AsyncFn>(
@@ -11331,7 +11450,7 @@ impl Repository {
     }
 
     pub fn access(&mut self, _cx: &App) -> oneshot::Receiver<GitAccess> {
-        self.send_job("access", None, move |git_repo, _cx| async move {
+        self.send_read_job("access", None, move |git_repo, _cx| async move {
             match git_repo {
                 // TODO: Correctly handle remote repositories, where the user
                 // that's running the Zed remote may not own the `.git/`
@@ -12110,6 +12229,67 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    async fn test_repository(cx: &mut TestAppContext) -> Entity<Repository> {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ ".git": {}, "file.txt": "content" }))
+            .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        project.read_with(cx, |project, cx| project.active_repository(cx).unwrap())
+    }
+
+    #[gpui::test]
+    async fn test_read_jobs_do_not_wait_for_status_scans(cx: &mut TestAppContext) {
+        let repository = test_repository(cx).await;
+        let (release_scan, scan_released) = oneshot::channel::<()>();
+        let (mut scan, mut read) = repository.update(cx, |repository, _| {
+            let scan = repository.send_keyed_job(
+                "scan",
+                Some(GitJobKey::ReloadGitState),
+                None,
+                move |_, _| async move {
+                    scan_released.await.ok();
+                },
+            );
+            let read = repository.send_read_job("read", None, |_, _| async {});
+            (scan, read)
+        });
+        cx.run_until_parked();
+
+        assert!(
+            read.try_recv().unwrap().is_some(),
+            "a read must finish while a status scan is still running"
+        );
+        assert!(scan.try_recv().unwrap().is_none());
+        release_scan.send(()).unwrap();
+        cx.run_until_parked();
+        assert!(scan.try_recv().unwrap().is_some());
+    }
+
+    #[gpui::test]
+    async fn test_read_jobs_wait_for_pending_mutations(cx: &mut TestAppContext) {
+        let repository = test_repository(cx).await;
+        let (release_mutation, mutation_released) = oneshot::channel::<()>();
+        let (mut mutation, mut read) = repository.update(cx, |repository, _| {
+            let mutation = repository.send_job("mutation", None, move |_, _| async move {
+                mutation_released.await.ok();
+            });
+            let read = repository.send_read_job("read", None, |_, _| async {});
+            (mutation, read)
+        });
+        cx.run_until_parked();
+
+        assert!(
+            read.try_recv().unwrap().is_none(),
+            "a read submitted behind a pending mutation must wait for it"
+        );
+        release_mutation.send(()).unwrap();
+        cx.run_until_parked();
+        assert!(mutation.try_recv().unwrap().is_some());
+        assert!(read.try_recv().unwrap().is_some());
     }
 
     type TestPasswordPrompt = (
