@@ -537,7 +537,10 @@ message Envelope {
     GitFileRevisionNeighbors git_file_revision_neighbors = 505;
     GitFileRevisionNeighborsResponse git_file_revision_neighbors_response = 506;
     GitFileHistoryStats git_file_history_stats = 507;
-    GitFileHistoryStatsResponse git_file_history_stats_response = 508; // current max
+    GitFileHistoryStatsResponse git_file_history_stats_response = 508;
+    GitTags git_tags = 509;
+    GitTagsResponse git_tags_response = 510;
+    LoadRangeDiff load_range_diff = 511; // current max
   }
 
   reserved 87 to 88;

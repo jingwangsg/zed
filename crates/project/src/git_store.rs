@@ -240,6 +240,40 @@ impl CommitFile {
     }
 }
 
+fn commit_diff_to_proto(commit_diff: CommitDiff) -> proto::LoadCommitDiffResponse {
+    proto::LoadCommitDiffResponse {
+        files: commit_diff
+            .files
+            .into_iter()
+            .map(|file| proto::CommitFile {
+                path: file.path.as_unix_str().to_owned(),
+                old_text: file.old_text,
+                new_text: file.new_text,
+                is_binary: file.is_binary,
+            })
+            .collect(),
+        is_shallow_boundary: commit_diff.is_shallow_boundary,
+    }
+}
+
+fn commit_diff_from_proto(response: proto::LoadCommitDiffResponse) -> Result<CommitDiff> {
+    Ok(CommitDiff {
+        files: response
+            .files
+            .into_iter()
+            .map(|file| {
+                Ok(CommitFile {
+                    path: RepoPath::from_proto(&file.path)?,
+                    old_text: file.old_text,
+                    new_text: file.new_text,
+                    is_binary: file.is_binary,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        is_shallow_boundary: response.is_shallow_boundary,
+    })
+}
+
 fn decode_commit_diff(diff: git::repository::CommitDiff) -> CommitDiff {
     let files = diff
         .files
@@ -1116,6 +1150,8 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_contributors);
         client.add_entity_request_handler(Self::handle_file_revision_neighbors);
         client.add_entity_request_handler(Self::handle_file_history_stats);
+        client.add_entity_request_handler(Self::handle_tags);
+        client.add_entity_request_handler(Self::handle_load_range_diff);
         client.add_entity_request_handler(Self::handle_edit_ref);
         client.add_entity_request_handler(Self::handle_repair_worktrees);
         client.add_entity_request_handler(Self::handle_get_commit_data);
@@ -4066,6 +4102,36 @@ impl GitStore {
         })
     }
 
+    async fn handle_tags(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitTags>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitTagsResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let tags = repository_handle
+            .update(&mut cx, |repository_handle, _| repository_handle.tags())
+            .await??;
+        Ok(proto::GitTagsResponse {
+            tags: tags.into_iter().map(|tag| tag.to_string()).collect(),
+        })
+    }
+
+    async fn handle_load_range_diff(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::LoadRangeDiff>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::LoadCommitDiffResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let commit_diff = repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.load_range_diff(envelope.payload.base, envelope.payload.head)
+            })
+            .await??;
+        Ok(commit_diff_to_proto(commit_diff))
+    }
+
     async fn handle_file_history_stats(
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::GitFileHistoryStats>,
@@ -4803,19 +4869,7 @@ impl GitStore {
                 )
             })
             .await??;
-        Ok(proto::LoadCommitDiffResponse {
-            files: commit_diff
-                .files
-                .into_iter()
-                .map(|file| proto::CommitFile {
-                    path: file.path.as_unix_str().to_owned(),
-                    old_text: file.old_text,
-                    new_text: file.new_text,
-                    is_binary: file.is_binary,
-                })
-                .collect(),
-            is_shallow_boundary: commit_diff.is_shallow_boundary,
-        })
+        Ok(commit_diff_to_proto(commit_diff))
     }
 
     async fn handle_reset(
@@ -7561,21 +7615,36 @@ impl Repository {
                             ignore_shallow_boundary,
                         })
                         .await?;
-                    Ok(CommitDiff {
-                        files: response
-                            .files
-                            .into_iter()
-                            .map(|file| {
-                                Ok(CommitFile {
-                                    path: RepoPath::from_proto(&file.path)?,
-                                    old_text: file.old_text,
-                                    new_text: file.new_text,
-                                    is_binary: file.is_binary,
-                                })
-                            })
-                            .collect::<Result<Vec<_>>>()?,
-                        is_shallow_boundary: response.is_shallow_boundary,
-                    })
+                    commit_diff_from_proto(response)
+                }
+            }
+        })
+    }
+
+    pub fn load_range_diff(
+        &mut self,
+        base: String,
+        head: String,
+    ) -> oneshot::Receiver<Result<CommitDiff>> {
+        let id = self.id;
+        self.send_read_job("load_range_diff", None, move |git_repo, _cx| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => backend
+                    .load_range_diff(base, head)
+                    .await
+                    .map(decode_commit_diff),
+                RepositoryState::Remote(RemoteRepositoryState {
+                    client, project_id, ..
+                }) => {
+                    let response = client
+                        .request(proto::LoadRangeDiff {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                            base,
+                            head,
+                        })
+                        .await?;
+                    commit_diff_from_proto(response)
                 }
             }
         })
@@ -9761,6 +9830,26 @@ impl Repository {
                 }
             },
         )
+    }
+
+    pub fn tags(&mut self) -> oneshot::Receiver<Result<Vec<SharedString>>> {
+        let id = self.id;
+        self.send_read_job("tags", None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.tags().await
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    let response = client
+                        .request(proto::GitTags {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                        })
+                        .await?;
+                    Ok(response.tags.into_iter().map(SharedString::from).collect())
+                }
+            }
+        })
     }
 
     pub fn file_history_stats(

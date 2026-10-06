@@ -758,6 +758,22 @@ message GitFileRevisionStats {
   uint32 deletions = 5;
 }
 
+message GitTags {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+}
+
+message GitTagsResponse {
+  repeated string tags = 1;
+}
+
+message LoadRangeDiff {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string base = 3;
+  string head = 4;
+}
+
 message GitEditRef {
   uint64 project_id = 1;
   uint64 repository_id = 2;

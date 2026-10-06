@@ -525,6 +525,8 @@ impl Server {
                 forward_read_only_project_request::<proto::GitFileRevisionNeighbors>,
             )
             .add_request_handler(forward_read_only_project_request::<proto::GitFileHistoryStats>)
+            .add_request_handler(forward_read_only_project_request::<proto::GitTags>)
+            .add_request_handler(forward_read_only_project_request::<proto::LoadRangeDiff>)
             .add_request_handler(forward_read_only_project_request::<proto::GetCommitData>)
             .add_request_stream_handler(
                 forward_read_only_project_stream_request::<proto::GetInitialGraphData>,

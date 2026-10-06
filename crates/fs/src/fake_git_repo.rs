@@ -1733,6 +1733,33 @@ impl GitRepository for FakeGitRepository {
         }))
     }
 
+    fn tags(&self) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+        self.with_state_async(false, |state| {
+            let mut tags: Vec<SharedString> = state
+                .refs
+                .keys()
+                .filter_map(|ref_name| ref_name.strip_prefix("refs/tags/"))
+                .map(|tag| SharedString::from(tag.to_string()))
+                .collect();
+            tags.sort();
+            Ok(tags)
+        })
+    }
+
+    fn load_range_diff(
+        &self,
+        _base: String,
+        _head: String,
+    ) -> BoxFuture<'_, Result<git::repository::CommitDiff>> {
+        async {
+            Ok(git::repository::CommitDiff {
+                files: Vec::new(),
+                is_shallow_boundary: false,
+            })
+        }
+        .boxed()
+    }
+
     fn contributors(&self) -> BoxFuture<'_, Result<Vec<Contributor>>> {
         self.with_state_async(false, |state| {
             let mut counts: HashMap<(SharedString, SharedString), u32> = HashMap::default();
