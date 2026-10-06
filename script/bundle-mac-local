@@ -59,10 +59,16 @@ remote_binary="target/remote_server/$remote_triple/release/remote_server"
 gzip -f --stdout --best "$remote_binary.stripped" > "target/$remote_archive"
 
 echo "Compiling zed binaries"
-if ! script/generate-licenses; then
+# Rewriting assets/licenses.md with unchanged content still bumps its mtime, and cargo then
+# rebuilds the `assets` crate and everything above it (about 30 minutes).
+licenses_file=$(mktemp)
+if script/generate-licenses "$licenses_file"; then
+    cmp -s "$licenses_file" assets/licenses.md || cat "$licenses_file" > assets/licenses.md
+else
     echo "script/generate-licenses failed; keeping the existing assets/licenses.md"
     test -s assets/licenses.md
 fi
+rm -f "$licenses_file"
 cargo --config .cargo/bundle-config.toml build --release --package zed --package cli
 
 echo "Creating application bundle"
@@ -177,7 +183,8 @@ XML
 productbuild --distribution "$package_dir/Distribution.xml" --package-path "$package_dir" "$package_path"
 
 echo "Verifying installer package"
-installer -pkginfo -pkg "$package_path"
-echo "payload files: $(pkgutil --payload-files "$package_path" | wc -l | tr -d ' '), bundle files: $(find "${app_path}" | wc -l | tr -d ' ')"
+# /usr/sbin is not on PATH in every shell this script runs from.
+/usr/sbin/installer -pkginfo -pkg "$package_path"
+echo "payload files: $(/usr/sbin/pkgutil --payload-files "$package_path" | wc -l | tr -d ' '), bundle files: $(find "${app_path}" | wc -l | tr -d ' ')"
 shasum -a 256 "target/$remote_archive" "$package_path"
 echo "Created ${package_path}"
