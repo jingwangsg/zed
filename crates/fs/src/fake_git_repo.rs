@@ -1764,16 +1764,49 @@ impl GitRepository for FakeGitRepository {
 
     fn load_range_diff(
         &self,
-        _base: String,
-        _head: String,
+        base: String,
+        head: String,
     ) -> BoxFuture<'_, Result<git::repository::CommitDiff>> {
-        async {
+        self.with_state_async(false, move |state| {
+            let state = &*state;
+            let tree = |revision: &str| {
+                let sha = state
+                    .refs
+                    .get(revision)
+                    .map(String::as_str)
+                    .unwrap_or(revision);
+                if state.refs.get("HEAD").map(String::as_str) == Some(sha) {
+                    return Ok(&state.head_contents);
+                }
+                state
+                    .commit_history
+                    .iter()
+                    .find(|snapshot| snapshot.sha == sha)
+                    .map(|snapshot| &snapshot.head_contents)
+                    .with_context(|| format!("unable to resolve revision: {revision}"))
+            };
+            let (base_tree, head_tree) = (tree(&base)?, tree(&head)?);
+            let mut files = base_tree
+                .keys()
+                .chain(head_tree.keys())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .filter_map(|path| {
+                    let (old_content, new_content) = (base_tree.get(path), head_tree.get(path));
+                    (old_content != new_content).then(|| git::repository::CommitFile {
+                        path: path.clone(),
+                        old_content: old_content.cloned(),
+                        new_content: new_content.cloned(),
+                        is_binary: false,
+                    })
+                })
+                .collect::<Vec<_>>();
+            files.sort_by(|left, right| left.path.cmp(&right.path));
             Ok(git::repository::CommitDiff {
-                files: Vec::new(),
+                files,
                 is_shallow_boundary: false,
             })
-        }
-        .boxed()
+        })
     }
 
     fn contributors(&self) -> BoxFuture<'_, Result<Vec<Contributor>>> {

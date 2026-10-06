@@ -55,7 +55,7 @@ mod fake_git_repo;
 #[cfg(feature = "test-support")]
 use collections::{BTreeMap, btree_map};
 #[cfg(feature = "test-support")]
-use fake_git_repo::{FakeCommitDataEntry, FakeGitRepositoryState};
+use fake_git_repo::{FakeCommitDataEntry, FakeCommitSnapshot, FakeGitRepositoryState};
 #[cfg(feature = "test-support")]
 use git::{
     repository::{CommitData, InitialGraphCommitData, RepoPath, Worktree, repo_path},
@@ -2423,6 +2423,26 @@ impl FakeFs {
                     .map(|(path, content)| (repo_path(path), content.as_bytes().to_vec())),
             );
             state.refs.insert("HEAD".into(), sha.into());
+        })
+        .unwrap();
+    }
+
+    pub fn add_commit_for_repo(
+        &self,
+        dot_git: &Path,
+        contents_by_path: &[(&str, String)],
+        sha: impl Into<String>,
+    ) {
+        self.with_git_state(dot_git, true, |state| {
+            let head_contents = contents_by_path
+                .iter()
+                .map(|(path, content)| (repo_path(path), content.as_bytes().to_vec()))
+                .collect::<collections::HashMap<_, _>>();
+            state.commit_history.push(FakeCommitSnapshot {
+                index_contents: head_contents.clone(),
+                head_contents,
+                sha: sha.into(),
+            });
         })
         .unwrap();
     }

@@ -1,6 +1,7 @@
 use git_ui_core::askpass_modal::AskPassModal;
 pub(crate) use git_ui_core::notifications::{open_output, show_error_toast};
 
+use crate::branch_diff::BranchDiff;
 use crate::commit_context_menu::{
     CommitContextMenuData, CommitContextMenuSource, commit_context_menu,
 };
@@ -66,7 +67,9 @@ use project::git_store::GitAccess;
 use project::{
     Fs, Project, ProjectPath,
     git_store::{
-        CommitDataState, GitStoreEvent, Repository, RepositoryEvent, RepositoryId, pending_op,
+        CommitDataState, GitStoreEvent, Repository, RepositoryEvent, RepositoryId,
+        diff_buffer_list::{BranchDiffEvent, DiffBase},
+        pending_op,
     },
     project_settings::{GitPathStyle, ProjectSettings},
 };
@@ -1008,6 +1011,14 @@ struct TreeNode {
     files: Vec<GitStatusEntry>,
 }
 
+/// The comparison tab the Changes list shows instead of the working tree while that tab
+/// is active, as GitLens's compare results are a tree of the compared files.
+#[derive(PartialEq)]
+enum FollowedComparison {
+    BranchDiff(Entity<BranchDiff>),
+    Commit(Entity<CommitView>),
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct GitStatusEntry {
     pub(crate) repo_path: RepoPath,
@@ -1159,6 +1170,7 @@ pub struct GitPanel {
     commit_history: CommitHistory,
     focused_history_entry: Option<usize>,
     history_keyboard_nav: bool,
+    followed_comparison: Option<(FollowedComparison, Subscription)>,
     _commit_message_buffer_subscription: Option<Subscription>,
     _repo_subscriptions: Vec<Subscription>,
     _settings_subscription: Subscription,
@@ -1246,6 +1258,7 @@ impl GitPanel {
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         let project = workspace.project().clone();
+        let workspace_handle = cx.entity();
         let app_state = workspace.app_state().clone();
         let fs = app_state.fs.clone();
         let git_store = project.read(cx).git_store().clone();
@@ -1409,6 +1422,17 @@ impl GitPanel {
             )
             .detach();
 
+            cx.subscribe_in(
+                &workspace_handle,
+                window,
+                |this, _workspace, event, window, cx| {
+                    if let workspace::Event::ActiveItemChanged = event {
+                        this.follow_active_comparison(window, cx);
+                    }
+                },
+            )
+            .detach();
+
             let mut this = Self {
                 active_repository,
                 commit_editor,
@@ -1464,6 +1488,7 @@ impl GitPanel {
                 commit_history: CommitHistory::Loading,
                 focused_history_entry: None,
                 history_keyboard_nav: false,
+                followed_comparison: None,
                 _commit_message_buffer_subscription: None,
                 _repo_subscriptions: Vec::new(),
                 _settings_subscription,
@@ -1474,6 +1499,11 @@ impl GitPanel {
             };
 
             this.schedule_update(window, cx);
+            // The panel is built inside a workspace update, which must finish before the
+            // active item can be read.
+            cx.defer_in(window, |this, window, cx| {
+                this.follow_active_comparison(window, cx)
+            });
             this
         })
     }
@@ -2315,8 +2345,15 @@ impl GitPanel {
     }
 
     fn change_entries_by_path(&self) -> impl Iterator<Item = &GitStatusEntry> {
+        // While a comparison is followed the rows are committed files, so nothing that
+        // stages, discards, or commits may see them.
+        let entries: &[GitListEntry] = if self.lists_comparison() {
+            &[]
+        } else {
+            &self.entries
+        };
         // A grouping can project one changed file into multiple list rows.
-        self.entries
+        entries
             .iter()
             .filter_map(GitListEntry::status_entry)
             .unique_by(|entry| entry.repo_path.clone())
@@ -2372,6 +2409,30 @@ impl GitPanel {
             .cloned()
         {
             self.toggle_directory(&dir_entry.key, window, cx);
+            return;
+        }
+        if let Some((followed, _)) = &self.followed_comparison {
+            let Some(entry) = self
+                .selected_entry
+                .and_then(|index| self.entries.get(index))
+                .and_then(|entry| entry.status_entry())
+                .cloned()
+            else {
+                return;
+            };
+            let focus_handle = match followed {
+                FollowedComparison::BranchDiff(view) => {
+                    view.update(cx, |view, cx| view.move_to_entry(entry, window, cx));
+                    view.focus_handle(cx)
+                }
+                FollowedComparison::Commit(view) => {
+                    view.update(cx, |view, cx| {
+                        view.move_to_path(&entry.repo_path, window, cx)
+                    });
+                    view.focus_handle(cx)
+                }
+            };
+            focus_handle.focus(window, cx);
             return;
         }
         maybe!({
@@ -2519,6 +2580,9 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.lists_comparison() {
+            return;
+        }
         let marked = self.effective_status_entries();
         if marked.len() > 1 {
             self.revert_entries(marked, action.skip_prompt, window, cx);
@@ -3119,6 +3183,9 @@ impl GitPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.lists_comparison() {
+            return;
+        }
         let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
@@ -3374,6 +3441,9 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.lists_comparison() {
+            return;
+        }
         let entries = self.effective_status_entries();
         if entries.len() > 1 {
             let Some(repo) = self.active_repository.as_ref() else {
@@ -3411,6 +3481,9 @@ impl GitPanel {
     }
 
     fn stage_selected(&mut self, _: &git::StageFile, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.lists_comparison() {
+            return;
+        }
         let to_stage = self
             .effective_status_entries()
             .into_iter()
@@ -3427,6 +3500,9 @@ impl GitPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.lists_comparison() {
+            return;
+        }
         let to_unstage = self
             .effective_status_entries()
             .into_iter()
@@ -3644,6 +3720,10 @@ impl GitPanel {
             .detach();
         };
 
+        if self.lists_comparison() {
+            error_spawn("The Changes list is showing a comparison", window, cx);
+            return;
+        }
         if self.has_unstaged_conflicts() {
             error_spawn(
                 "There are still conflicts. You must stage these before committing",
@@ -5218,6 +5298,65 @@ impl GitPanel {
         });
     }
 
+    /// A followed comparison lists committed changes, so staging or discarding one of its
+    /// entries would act on an unrelated working-tree file.
+    fn lists_comparison(&self) -> bool {
+        self.followed_comparison.is_some()
+    }
+
+    fn follow_active_comparison(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active_item = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).active_item(cx));
+        let followed = active_item.and_then(|item| {
+            if let Some(branch_diff) = item.downcast::<BranchDiff>() {
+                // The plain project diff already lists what the working tree lists.
+                matches!(
+                    branch_diff.read(cx).diff_base(cx),
+                    DiffBase::Merge { .. } | DiffBase::Ref { .. }
+                )
+                .then_some(FollowedComparison::BranchDiff(branch_diff))
+            } else {
+                item.downcast::<CommitView>()
+                    .map(FollowedComparison::Commit)
+            }
+        });
+        if followed.as_ref()
+            == self
+                .followed_comparison
+                .as_ref()
+                .map(|(followed, _)| followed)
+        {
+            return;
+        }
+        self.followed_comparison = followed.map(|followed| {
+            let subscription = match &followed {
+                FollowedComparison::BranchDiff(view) => cx.subscribe_in(
+                    &view.read(cx).diff_list(cx),
+                    window,
+                    |this, _, _: &BranchDiffEvent, window, cx| this.schedule_update(window, cx),
+                ),
+                FollowedComparison::Commit(view) => {
+                    cx.observe_in(view, window, |this, _, window, cx| {
+                        this.schedule_update(window, cx)
+                    })
+                }
+            };
+            (followed, subscription)
+        });
+        // A tab switch should not wait out the status debounce.
+        self.update_visible_entries(window, cx);
+    }
+
+    fn comparison_title(&self, cx: &App) -> Option<SharedString> {
+        let (followed, _) = self.followed_comparison.as_ref()?;
+        Some(match followed {
+            FollowedComparison::BranchDiff(view) => view.read(cx).tab_content_text(0, cx),
+            FollowedComparison::Commit(view) => view.read(cx).tab_content_text(0, cx),
+        })
+    }
+
     fn update_visible_entries(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path_style = self.project.read(cx).path_style(cx);
         let selected_change = self.selected_entry.and_then(|index| {
@@ -5257,7 +5396,9 @@ impl GitPanel {
         let sort_by = settings.sort_by;
         let group_by = settings.group_by;
         let group_by_file_status = group_by == GitPanelGroupBy::Status;
-        let group_by_staging_state = group_by == GitPanelGroupBy::Staging;
+        // Comparison entries have no staging state to group by.
+        let group_by_staging_state =
+            group_by == GitPanelGroupBy::Staging && !self.lists_comparison();
         let is_tree_view = matches!(self.view_mode, GitPanelViewMode::Tree(_));
 
         if let Some(active_repo) = self.active_repository.as_ref() {
@@ -5309,58 +5450,88 @@ impl GitPanel {
 
         self.stash_entries = repo.cached_stash();
 
-        for status_entry in repo.cached_status() {
-            self.changes_count += 1;
-            let is_conflict = repo.had_conflict_on_last_merge_head_change(&status_entry.repo_path);
-            let is_new = status_entry.status.is_created();
-            let staging = status_entry.status.staging();
-
-            if let Some(pending) = repo.pending_ops_for_path(&status_entry.repo_path)
-                && pending
-                    .ops
-                    .iter()
-                    .any(|op| op.git_status == pending_op::GitStatus::Reverted && op.finished())
-            {
-                continue;
-            }
-
-            let entry = GitStatusEntry {
-                repo_path: status_entry.repo_path.clone(),
-                status: status_entry.status,
-                staging,
-                diff_stat: status_entry.diff_stat,
+        if let Some((followed, _)) = &self.followed_comparison {
+            let entry = |repo_path: RepoPath, status: FileStatus| GitStatusEntry {
+                repo_path,
+                status,
+                staging: StageStatus::Unstaged,
+                diff_stat: None,
             };
+            changed_entries = match followed {
+                FollowedComparison::BranchDiff(view) => view
+                    .read(cx)
+                    .diff_list(cx)
+                    .read(cx)
+                    .statuses_by_path()
+                    .map(|statuses| {
+                        statuses
+                            .iter()
+                            .map(|status| entry(status.repo_path.clone(), status.status))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                FollowedComparison::Commit(view) => view
+                    .read(cx)
+                    .files()
+                    .map(|(repo_path, status)| entry(repo_path.clone(), status))
+                    .collect(),
+            };
+            self.changes_count = changed_entries.len();
+        } else {
+            for status_entry in repo.cached_status() {
+                self.changes_count += 1;
+                let is_conflict =
+                    repo.had_conflict_on_last_merge_head_change(&status_entry.repo_path);
+                let is_new = status_entry.status.is_created();
+                let staging = status_entry.status.staging();
 
-            if !is_conflict && !is_new {
-                tracked_entries.push(entry.clone());
-            }
+                if let Some(pending) = repo.pending_ops_for_path(&status_entry.repo_path)
+                    && pending
+                        .ops
+                        .iter()
+                        .any(|op| op.git_status == pending_op::GitStatus::Reverted && op.finished())
+                {
+                    continue;
+                }
 
-            if staging.has_staged() {
-                staged_count += 1;
-                single_staged_entry = Some(entry.clone());
-            }
+                let entry = GitStatusEntry {
+                    repo_path: status_entry.repo_path.clone(),
+                    status: status_entry.status,
+                    staging,
+                    diff_stat: status_entry.diff_stat,
+                };
 
-            if group_by_staging_state && is_conflict {
-                conflict_entries.push(entry);
-            } else if group_by_staging_state {
+                if !is_conflict && !is_new {
+                    tracked_entries.push(entry.clone());
+                }
+
                 if staging.has_staged() {
-                    staged_entries.push(GitStatusEntry {
-                        diff_stat: status_entry.staged_diff_stat,
-                        ..entry.clone()
-                    });
+                    staged_count += 1;
+                    single_staged_entry = Some(entry.clone());
                 }
-                if staging.has_unstaged() {
-                    unstaged_entries.push(GitStatusEntry {
-                        diff_stat: status_entry.unstaged_diff_stat,
-                        ..entry
-                    });
+
+                if group_by_staging_state && is_conflict {
+                    conflict_entries.push(entry);
+                } else if group_by_staging_state {
+                    if staging.has_staged() {
+                        staged_entries.push(GitStatusEntry {
+                            diff_stat: status_entry.staged_diff_stat,
+                            ..entry.clone()
+                        });
+                    }
+                    if staging.has_unstaged() {
+                        unstaged_entries.push(GitStatusEntry {
+                            diff_stat: status_entry.unstaged_diff_stat,
+                            ..entry
+                        });
+                    }
+                } else if group_by_file_status && is_conflict {
+                    conflict_entries.push(entry);
+                } else if group_by_file_status && is_new {
+                    new_entries.push(entry);
+                } else {
+                    changed_entries.push(entry);
                 }
-            } else if group_by_file_status && is_conflict {
-                conflict_entries.push(entry);
-            } else if group_by_file_status && is_new {
-                new_entries.push(entry);
-            } else {
-                changed_entries.push(entry);
             }
         }
 
@@ -6244,6 +6415,8 @@ impl GitPanel {
     pub fn configure_commit_button(&self, cx: &mut Context<Self>) -> (bool, &'static str) {
         if self.generate_commit_message_task.is_some() {
             (false, "Generating commit message...")
+        } else if self.lists_comparison() {
+            (false, "The Changes list is showing a comparison")
         } else if self.has_unstaged_conflicts() {
             (false, "You must resolve conflicts before committing")
         } else if !self.has_staged_changes() && !self.has_tracked_changes() && !self.amend_pending {
@@ -6416,8 +6589,13 @@ impl GitPanel {
                 .flex_wrap()
                 .gap_1()
                 .justify_between()
-                .child(
-                    ButtonLike::new("diff-button")
+                .child(match self.comparison_title(cx) {
+                    Some(title) => Label::new(title)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate()
+                        .into_any_element(),
+                    None => ButtonLike::new("diff-button")
                         .child(
                             h_flex()
                                 .gap_1()
@@ -6452,8 +6630,9 @@ impl GitPanel {
                             cx.defer(|cx| {
                                 cx.dispatch_action(&Diff);
                             })
-                        }),
-                )
+                        })
+                        .into_any_element(),
+                })
                 .child(
                     h_flex()
                         .gap_1()
@@ -7851,7 +8030,7 @@ impl GitPanel {
             });
 
         let checkbox = Checkbox::new("stage-file", is_staging_or_staged.into())
-            .disabled(!self.has_write_access(cx))
+            .disabled(!self.has_write_access(cx) || self.lists_comparison())
             .fill()
             .elevation(ElevationIndex::Surface)
             .on_click({
@@ -8172,6 +8351,9 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.lists_comparison() {
+            return;
+        }
         let Some(entry) = self.entries.get(ix).and_then(|e| e.status_entry()).cloned() else {
             return;
         };
@@ -8947,6 +9129,9 @@ impl GitPanel {
     }
 
     fn stage_bulk(&mut self, mut index: usize, stage: bool, cx: &mut Context<'_, Self>) {
+        if self.lists_comparison() {
+            return;
+        }
         let Some(op) = self.bulk_staging.as_ref() else {
             return;
         };
@@ -9180,7 +9365,7 @@ impl Render for GitPanel {
                                         && has_entries
                                     {
                                         this.child(self.render_entries(
-                                            has_write_access,
+                                            has_write_access && !self.lists_comparison(),
                                             repo,
                                             window,
                                             cx,
@@ -14084,8 +14269,15 @@ mod tests {
 
         let (fs, project, workspace, _panel, mut cx) =
             setup_git_panel_with_changes(cx, json!({ ".git": {} }), &[]).await;
-        let sha = format!("{:040x}", 1).parse::<Oid>().unwrap();
-        fs.set_head_for_repo(Path::new(path!("/project/.git")), &[], sha.to_string());
+        let dot_git = Path::new(path!("/project/.git"));
+        let base_sha = format!("{:040x}", 1);
+        fs.add_commit_for_repo(dot_git, &[], base_sha.clone());
+        fs.with_git_state(dot_git, false, |state| {
+            state.refs.insert("v1".into(), base_sha);
+        })
+        .unwrap();
+        let sha = format!("{:040x}", 2).parse::<Oid>().unwrap();
+        fs.set_head_for_repo(dot_git, &[], sha.to_string());
         cx.run_until_parked();
         let repository =
             project.read_with(&cx, |project, cx| project.active_repository(cx).unwrap());
@@ -14126,6 +14318,89 @@ mod tests {
             tab_texts.iter().any(|text| text == "v1..HEAD"),
             "{tab_texts:?}"
         );
+    }
+
+    #[gpui::test]
+    async fn test_changes_list_follows_the_active_comparison(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (fs, project, workspace, panel, mut cx) = setup_git_panel_with_changes(
+            cx,
+            json!({ ".git": {}, "a.txt": "changed" }),
+            &[("a.txt", StatusCode::Modified)],
+        )
+        .await;
+        let dot_git = Path::new(path!("/project/.git"));
+        let base_sha = format!("{:040x}", 1);
+        fs.add_commit_for_repo(
+            dot_git,
+            &[("a.txt", "older".into()), ("b.txt", "old".into())],
+            base_sha.clone(),
+        );
+        fs.with_git_state(dot_git, false, |state| {
+            state.refs.insert("v1".into(), base_sha);
+        })
+        .unwrap();
+        fs.set_head_for_repo(
+            dot_git,
+            &[("a.txt", "original".into())],
+            format!("{:040x}", 2),
+        );
+        cx.run_until_parked();
+        let working_tree_count = panel.read_with(&cx, |panel, _| {
+            assert!(panel.can_commit(), "the modified file is committable");
+            panel.changes_count
+        });
+        assert_eq!(working_tree_count, 1);
+
+        let repository =
+            project.read_with(&cx, |project, cx| project.active_repository(cx).unwrap());
+        workspace.update_in(&mut cx, |_, window, cx| {
+            CommitView::open_range(
+                "v1".into(),
+                "HEAD".into(),
+                repository.downgrade(),
+                cx.weak_entity(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.comparison_title(cx).as_deref(), Some("v1..HEAD"));
+            let listed_paths = panel
+                .entries
+                .iter()
+                .filter_map(GitListEntry::status_entry)
+                .map(|entry| &*entry.repo_path)
+                .collect::<Vec<&RelPath>>();
+            assert_eq!(
+                listed_paths,
+                [rel_path("a.txt"), rel_path("b.txt")],
+                "the list shows the files v1..HEAD changed"
+            );
+            assert_eq!(panel.changes_count, 2);
+            assert!(
+                !panel.can_commit(),
+                "comparison rows must not count as committable changes"
+            );
+        });
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let item = cx.new(TestItem::new);
+            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.comparison_title(cx), None);
+            assert_eq!(
+                panel.changes_count, working_tree_count,
+                "a plain active item returns the list to the working tree"
+            );
+            assert!(panel.can_commit());
+        });
     }
 
     #[test]

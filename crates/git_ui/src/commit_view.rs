@@ -3,7 +3,8 @@ use buffer_diff::BufferDiff;
 use collections::HashMap;
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, HiddenDiffHunkRenderer, MultiBuffer,
-    SplittableEditor, hover_markdown_style, multibuffer_context_lines,
+    SelectionEffects, SplittableEditor, hover_markdown_style, multibuffer_context_lines,
+    scroll::Autoscroll,
 };
 use futures::channel::oneshot;
 use futures_lite::future::yield_now;
@@ -90,6 +91,9 @@ pub struct CommitView {
     is_shallow_boundary: bool,
     file_filter: Option<RepoPath>,
     comparison: Option<RefComparison>,
+    // The key is kept rather than recomputed: it is what the excerpts were inserted
+    // under, and `RepoPath` does not hand back the `Arc<RelPath>` a key is built from.
+    files: Vec<(RepoPath, FileStatus, PathKey)>,
     _load_diff_task: Task<Result<()>>,
 }
 
@@ -420,8 +424,10 @@ impl CommitView {
         let load_diff_task = cx.spawn_in(window, async move |this, cx| {
             let mut binary_buffer_ids: HashSet<language::BufferId> = HashSet::default();
             let mut file_statuses: HashMap<language::BufferId, FileStatus> = HashMap::default();
+            let mut files = Vec::new();
 
             for file in commit_diff.files {
+                let repo_path = file.path.clone();
                 let is_created = file.old_text.is_none();
                 let is_deleted = file.new_text.is_none();
                 let raw_new_text = file.new_text.unwrap_or_default();
@@ -473,13 +479,11 @@ impl CommitView {
                 } else {
                     StatusCode::Modified
                 };
-                file_statuses.insert(
-                    buffer_id,
-                    FileStatus::Tracked(TrackedStatus {
-                        index_status: status_code,
-                        worktree_status: StatusCode::Unmodified,
-                    }),
-                );
+                let status = FileStatus::Tracked(TrackedStatus {
+                    index_status: status_code,
+                    worktree_status: StatusCode::Unmodified,
+                });
+                file_statuses.insert(buffer_id, status);
 
                 if is_binary {
                     binary_buffer_ids.insert(buffer_id);
@@ -522,6 +526,7 @@ impl CommitView {
                     };
                     (ranges, path)
                 })?;
+                files.push((repo_path, status, path.clone()));
 
                 // Batch the insertion of excerpts and yield between batches, to avoid blocking the main thread when a single file has many hunks.
                 const EXCERPT_BATCH_SIZE: usize = 10;
@@ -569,6 +574,8 @@ impl CommitView {
                         });
                     });
                 }
+                this.files = files;
+                cx.notify();
             })?;
 
             anyhow::Ok(())
@@ -604,8 +611,40 @@ impl CommitView {
             is_shallow_boundary,
             file_filter,
             comparison,
+            files: Vec::new(),
             _load_diff_task: load_diff_task,
         }
+    }
+
+    pub(crate) fn files(&self) -> impl Iterator<Item = (&RepoPath, FileStatus)> {
+        self.files
+            .iter()
+            .map(|(repo_path, status, _)| (repo_path, *status))
+    }
+
+    pub(crate) fn move_to_path(
+        &mut self,
+        repo_path: &RepoPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, _, path_key)) = self.files.iter().find(|(path, _, _)| path == repo_path)
+        else {
+            return;
+        };
+        let Some(position) = self.multibuffer.read(cx).location_for_path(path_key, cx) else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, cx| {
+                editor.change_selections(
+                    SelectionEffects::scroll(Autoscroll::focused()),
+                    window,
+                    cx,
+                    |selections| selections.select_ranges([position..position]),
+                );
+            })
+        });
     }
 
     fn render_shallow_boundary_notice(&self, cx: &App) -> impl IntoElement {
@@ -1488,6 +1527,7 @@ impl Item for CommitView {
                 is_shallow_boundary: self.is_shallow_boundary,
                 file_filter: self.file_filter.clone(),
                 comparison: self.comparison.clone(),
+                files: self.files.clone(),
                 _load_diff_task: Task::ready(Ok(())),
             }
         })))
