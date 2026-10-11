@@ -2,11 +2,12 @@ use anyhow::{Context as _, Result};
 use buffer_diff::BufferDiff;
 use collections::HashMap;
 use editor::{
-    Addon, Editor, EditorEvent, EditorSettings, HiddenDiffHunkRenderer, MultiBuffer,
-    SelectionEffects, SplittableEditor, hover_markdown_style, multibuffer_context_lines,
-    scroll::Autoscroll,
+    Addon, Editor, EditorEvent, EditorSettings, GotoDefinitionKind, HiddenDiffHunkRenderer,
+    MultiBuffer, RenameTarget, SelectionEffects, SemanticsProvider, SplittableEditor,
+    hover_markdown_style, multibuffer_context_lines, scroll::Autoscroll,
 };
 use futures::channel::oneshot;
+use futures::future::Shared;
 use futures_lite::future::yield_now;
 use git::Oid;
 use git::repository::{CommitDetails, RepoPath};
@@ -22,20 +23,25 @@ use gpui::{
     WeakEntity, Window, actions,
 };
 use language::{
-    Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, OffsetRangeExt as _,
-    ReplicaId, Rope, TextBuffer,
+    Buffer, BufferRow, Capability, DiskState, File, LanguageRegistry, LanguageServerId, LineEnding,
+    Location, OffsetRangeExt as _, Point, ReplicaId, Rope, TextBuffer, ToPoint as _, line_diff,
 };
 use markdown::{Markdown, MarkdownElement};
 use multi_buffer::PathKey;
 use project::{
-    Project, ProjectPath, WorktreeId,
+    DocumentHighlight, Hover, InlayHint, InvalidationStrategy, LocationLink, Project, ProjectPath,
+    ProjectTransaction, WorktreeId,
     git_store::{CommitDiff, Repository, UnshallowState},
+    lsp_store::{BufferSemanticTokens, CacheInlayHints, OpenLspBufferHandle},
 };
 use settings::{DiffViewStyle, Settings};
 use std::{
     any::{Any, TypeId},
+    cell::RefCell,
     collections::HashSet,
+    ops::Range,
     path::PathBuf,
+    rc::Rc,
     sync::Arc,
 };
 use theme::ActiveTheme;
@@ -412,6 +418,11 @@ impl CommitView {
                 editor.set_show_bookmarks(false, cx);
                 editor.set_show_breakpoints(false, cx);
                 editor.set_show_diff_review_button(true, cx);
+                editor.set_semantics_provider(Some(Rc::new(CommitSemanticsProvider {
+                    project: project.downgrade(),
+                    repository: repository.clone(),
+                    live_buffers: Rc::default(),
+                })));
             });
 
             editor
@@ -1248,6 +1259,302 @@ impl language::File for GitBlob {
     }
 }
 
+/// Answers language server requests about a commit's file snapshots by asking
+/// about the same line in the project's current copy of the file. Language
+/// servers only know files on disk, so a `GitBlob` buffer cannot be queried
+/// directly.
+struct CommitSemanticsProvider {
+    project: WeakEntity<Project>,
+    repository: Entity<Repository>,
+    // Keeps each live buffer registered with its language servers while the
+    // commit view is open, so hovering does not open and close the document
+    // on the server for every request.
+    live_buffers: Rc<RefCell<HashMap<ProjectPath, (Entity<Buffer>, OpenLspBufferHandle)>>>,
+}
+
+struct LivePosition {
+    buffer: Entity<Buffer>,
+    position: language::Anchor,
+    blob_row: u32,
+}
+
+impl LivePosition {
+    /// Only the queried line is known to be identical in both versions, so
+    /// ranges on other lines are dropped.
+    fn range_in_blob(
+        &self,
+        range: Range<language::Anchor>,
+        live: &Buffer,
+        blob: &Buffer,
+    ) -> Option<Range<language::Anchor>> {
+        let live_row = self.position.to_point(live).row;
+        let start = range.start.to_point(live);
+        let end = range.end.to_point(live);
+        if start.row != live_row || end.row != live_row {
+            return None;
+        }
+        Some(
+            blob.anchor_before(Point::new(self.blob_row, start.column))
+                ..blob.anchor_after(Point::new(self.blob_row, end.column)),
+        )
+    }
+}
+
+impl CommitSemanticsProvider {
+    /// Resolves `position` in a commit blob to the same line of the project's
+    /// live copy of the file. Returns `None` when `buffer` is not a commit
+    /// blob, so the request goes to the project untouched. The task yields
+    /// `None` when the file has no live copy or the line changed after the
+    /// commit.
+    fn live_position(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: language::Anchor,
+        cx: &mut App,
+    ) -> Option<Task<Result<Option<LivePosition>>>> {
+        let blob = buffer.read(cx);
+        let file = blob.file()?;
+        let git_blob = (file.as_ref() as &dyn Any).downcast_ref::<GitBlob>()?;
+        if git_blob.is_deleted || git_blob.is_binary {
+            return Some(Task::ready(Ok(None)));
+        }
+        let project_path = self
+            .repository
+            .read(cx)
+            .repo_path_to_project_path(&git_blob.path, cx)
+            .unwrap_or(ProjectPath {
+                worktree_id: git_blob.worktree_id,
+                path: file.path().clone(),
+            });
+        let blob_point = position.to_point(blob);
+        let blob_text = blob.text();
+        let project = self.project.upgrade()?;
+        if project.read(cx).entry_for_path(&project_path, cx).is_none() {
+            return Some(Task::ready(Ok(None)));
+        }
+        let cached_buffer = self
+            .live_buffers
+            .borrow()
+            .get(&project_path)
+            .map(|(live_buffer, _)| live_buffer.clone());
+        let open_buffer = match cached_buffer {
+            Some(live_buffer) => Task::ready(Ok(live_buffer)),
+            None => project.update(cx, |project, cx| {
+                project.open_buffer(project_path.clone(), cx)
+            }),
+        };
+        let live_buffers = self.live_buffers.clone();
+        Some(cx.spawn(async move |cx| {
+            let live_buffer = open_buffer.await?;
+            cx.update(|cx| {
+                if !live_buffers.borrow().contains_key(&project_path) {
+                    let handle = project.update(cx, |project, cx| {
+                        project.register_buffer_with_language_servers(&live_buffer, cx)
+                    });
+                    live_buffers
+                        .borrow_mut()
+                        .insert(project_path, (live_buffer.clone(), handle));
+                }
+                let live = live_buffer.read(cx);
+                let Some(row) = live_row_for_blob_row(&blob_text, &live.text(), blob_point.row)
+                else {
+                    return Ok(None);
+                };
+                let live_point = Point::new(row, blob_point.column);
+                Ok(Some(LivePosition {
+                    position: live.anchor_before(live_point),
+                    buffer: live_buffer.clone(),
+                    blob_row: blob_point.row,
+                }))
+            })
+        }))
+    }
+}
+
+/// `None` means the line at `blob_row` was changed or removed after the
+/// commit, so a language server is never asked about a position that no
+/// longer holds the symbol.
+fn live_row_for_blob_row(blob_text: &str, live_text: &str, blob_row: u32) -> Option<u32> {
+    let mut row_offset = 0i64;
+    for (live_rows, blob_rows) in line_diff(live_text, blob_text) {
+        if blob_rows.contains(&blob_row) {
+            return None;
+        }
+        if blob_rows.start > blob_row {
+            break;
+        }
+        row_offset += live_rows.len() as i64 - blob_rows.len() as i64;
+    }
+    u32::try_from(i64::from(blob_row) + row_offset).ok()
+}
+
+impl SemanticsProvider for CommitSemanticsProvider {
+    fn hover(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: language::Anchor,
+        cx: &mut App,
+    ) -> Option<Task<Option<Vec<Hover>>>> {
+        let Some(live_position) = self.live_position(buffer, position, cx) else {
+            return self.project.hover(buffer, position, cx);
+        };
+        let project = self.project.clone();
+        let blob = buffer.clone();
+        Some(cx.spawn(async move |cx| {
+            let live = live_position.await.log_err().flatten()?;
+            let hovers = cx
+                .update(|cx| project.hover(&live.buffer, live.position, cx))?
+                .await?;
+            Some(cx.update(|cx| {
+                let blob_buffer = blob.read(cx);
+                let live_buffer = live.buffer.read(cx);
+                hovers
+                    .into_iter()
+                    .map(|mut hover| {
+                        hover.range = hover
+                            .range
+                            .and_then(|range| live.range_in_blob(range, live_buffer, blob_buffer));
+                        hover
+                    })
+                    .collect()
+            }))
+        }))
+    }
+
+    fn definitions(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: language::Anchor,
+        kind: GotoDefinitionKind,
+        cx: &mut App,
+    ) -> Option<Task<Result<Option<Vec<LocationLink>>>>> {
+        let Some(live_position) = self.live_position(buffer, position, cx) else {
+            return self.project.definitions(buffer, position, kind, cx);
+        };
+        let project = self.project.clone();
+        let blob = buffer.clone();
+        Some(cx.spawn(async move |cx| {
+            let Some(live) = live_position.await? else {
+                return Ok(None);
+            };
+            let Some(definitions) =
+                cx.update(|cx| project.definitions(&live.buffer, live.position, kind, cx))
+            else {
+                return Ok(None);
+            };
+            let Some(links) = definitions.await? else {
+                return Ok(None);
+            };
+            Ok(cx.update(|cx| {
+                let blob_buffer = blob.read(cx);
+                let live_buffer = live.buffer.read(cx);
+                let links = links
+                    .into_iter()
+                    .map(|mut link| {
+                        // The editor underlines the origin in the commit view,
+                        // so it has to be expressed in the blob buffer.
+                        link.origin = link
+                            .origin
+                            .and_then(|origin| {
+                                live.range_in_blob(origin.range, live_buffer, blob_buffer)
+                            })
+                            .map(|range| Location {
+                                buffer: blob.clone(),
+                                range,
+                            });
+                        link
+                    })
+                    .collect();
+                Some(links)
+            }))
+        }))
+    }
+
+    fn inline_values(
+        &self,
+        buffer_handle: Entity<Buffer>,
+        range: Range<language::Anchor>,
+        cx: &mut App,
+    ) -> Option<Task<Result<Vec<InlayHint>>>> {
+        self.project.inline_values(buffer_handle, range, cx)
+    }
+
+    fn applicable_inlay_chunks(
+        &self,
+        buffer: &Entity<Buffer>,
+        ranges: &[Range<language::Anchor>],
+        cx: &mut App,
+    ) -> Vec<Range<BufferRow>> {
+        self.project.applicable_inlay_chunks(buffer, ranges, cx)
+    }
+
+    fn invalidate_inlay_hints(
+        &self,
+        for_buffers: &collections::HashSet<language::BufferId>,
+        cx: &mut App,
+    ) {
+        self.project.invalidate_inlay_hints(for_buffers, cx)
+    }
+
+    fn inlay_hints(
+        &self,
+        invalidate: InvalidationStrategy,
+        buffer: Entity<Buffer>,
+        ranges: Vec<Range<language::Anchor>>,
+        known_chunks: Option<(clock::Global, collections::HashSet<Range<BufferRow>>)>,
+        cx: &mut App,
+    ) -> Option<HashMap<Range<BufferRow>, Task<Result<CacheInlayHints>>>> {
+        self.project
+            .inlay_hints(invalidate, buffer, ranges, known_chunks, cx)
+    }
+
+    fn semantic_tokens(
+        &self,
+        buffer: Entity<Buffer>,
+        cx: &mut App,
+    ) -> Option<Shared<Task<std::result::Result<BufferSemanticTokens, Arc<anyhow::Error>>>>> {
+        self.project.semantic_tokens(buffer, cx)
+    }
+
+    fn supports_inlay_hints(&self, buffer: &Entity<Buffer>, cx: &mut App) -> bool {
+        self.project.supports_inlay_hints(buffer, cx)
+    }
+
+    fn supports_semantic_tokens(&self, buffer: &Entity<Buffer>, cx: &mut App) -> bool {
+        self.project.supports_semantic_tokens(buffer, cx)
+    }
+
+    fn document_highlights(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: language::Anchor,
+        cx: &mut App,
+    ) -> Option<Task<Result<Vec<DocumentHighlight>>>> {
+        self.project.document_highlights(buffer, position, cx)
+    }
+
+    fn range_for_rename(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: language::Anchor,
+        cx: &mut App,
+    ) -> Task<Result<Option<RenameTarget>>> {
+        self.project.range_for_rename(buffer, position, cx)
+    }
+
+    fn perform_rename(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: language::Anchor,
+        new_name: String,
+        language_server_id: Option<LanguageServerId>,
+        cx: &mut App,
+    ) -> Option<Task<Result<ProjectTransaction>>> {
+        self.project
+            .perform_rename(buffer, position, new_name, language_server_id, cx)
+    }
+}
+
 pub(crate) async fn build_buffer(
     mut text: String,
     blob: Arc<dyn File>,
@@ -1472,6 +1779,7 @@ impl Item for CommitView {
             return Task::ready(None);
         };
         let project = self.project.clone();
+        let repository = self.repository.clone();
         let diff_view_style = self.editor.read(cx).diff_view_style();
         let multibuffer = self.multibuffer.clone();
         Task::ready(Some(cx.new(|cx| {
@@ -1479,6 +1787,7 @@ impl Item for CommitView {
             let editor = cx.new({
                 let file_statuses = file_statuses.clone();
                 let project = project.clone();
+                let repository = repository.clone();
                 let workspace_entity = workspace_entity.clone();
                 let multibuffer = multibuffer.clone();
                 move |cx| {
@@ -1495,6 +1804,11 @@ impl Item for CommitView {
                         editor.set_show_bookmarks(false, cx);
                         editor.set_show_breakpoints(false, cx);
                         editor.set_show_diff_review_button(true, cx);
+                        editor.set_semantics_provider(Some(Rc::new(CommitSemanticsProvider {
+                            project: project.downgrade(),
+                            repository: repository.clone(),
+                            live_buffers: Rc::default(),
+                        })));
                         editor.register_addon(CommitDiffAddon {
                             file_statuses,
                             commit_view,
@@ -1682,4 +1996,35 @@ fn stash_matches_index(sha: &str, stash_index: usize, repo: &Repository) -> bool
         .get(stash_index)
         .map(|entry| entry.oid.to_string() == sha)
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::live_row_for_blob_row;
+
+    #[test]
+    fn live_row_follows_edits_made_after_the_commit() {
+        let blob = "a\nb\nc\nd\n";
+
+        assert_eq!(live_row_for_blob_row(blob, blob, 2), Some(2));
+        // Lines inserted before the queried line push it down, including an
+        // insertion directly above it.
+        assert_eq!(
+            live_row_for_blob_row(blob, "x\ny\na\nb\nc\nd\n", 2),
+            Some(4)
+        );
+        assert_eq!(live_row_for_blob_row(blob, "a\nb\nx\nc\nd\n", 2), Some(3));
+        // Lines removed before the queried line pull it up.
+        assert_eq!(live_row_for_blob_row(blob, "a\nc\nd\n", 2), Some(1));
+        // Edits after the queried line leave it alone.
+        assert_eq!(
+            live_row_for_blob_row(blob, "a\nb\nc\nchanged\nmore\n", 2),
+            Some(2)
+        );
+        // The queried line itself was changed or removed.
+        assert_eq!(live_row_for_blob_row(blob, "a\nb\nC\nd\n", 2), None);
+        assert_eq!(live_row_for_blob_row(blob, "a\nb\nd\n", 2), None);
+        // A missing trailing newline only affects the last line.
+        assert_eq!(live_row_for_blob_row("a\nb\nc", "a\nb\nc\n", 1), Some(1));
+    }
 }
