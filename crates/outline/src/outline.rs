@@ -7,7 +7,7 @@ use editor::{MultiBufferOffset, RowHighlightOptions, SelectionEffects};
 use fuzzy_nucleo::StringMatch;
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
-    ParentElement, Point, Rems, Render, Styled, StyledText, Task, WeakEntity, Window, div, rems,
+    ParentElement, Point, Rems, Render, Styled, StyledText, Subscription, Task, Window, div, rems,
 };
 use language::{OffsetRangeExt, Outline, OutlineItem, OutlineSearchEntry};
 use picker::{MatchLocation, Picker, PickerDelegate, PreviewUpdate};
@@ -15,8 +15,14 @@ use theme::ActiveTheme;
 use ui::{ListItem, ListItemSpacing, prelude::*, utils::buffer_text_style};
 use workspace::{DismissDecision, ModalView};
 
+mod breadcrumb_navigation;
+
 pub fn init(cx: &mut App) {
     cx.observe_new(OutlineView::register).detach();
+    // Must run after `editor::init`, which registers the editor's own renderer here.
+    cx.set_global(breadcrumbs::RenderBreadcrumbText(
+        breadcrumb_navigation::render_breadcrumb_text,
+    ));
     zed_actions::outline::TOGGLE_OUTLINE
         .set(|view, window, cx| {
             let Ok(editor) = view.downcast::<Editor>() else {
@@ -112,8 +118,42 @@ fn outline_for_editor(
     }))
 }
 
+/// Opens the outline as a popover attached to a breadcrumb segment. The
+/// picker is returned immediately with an empty outline and filled in once the
+/// symbols have loaded; `preselected_range` picks the symbol whose range matches
+/// instead of the one under the cursor.
+fn outline_popover(
+    editor: Entity<Editor>,
+    preselected_range: Option<Range<Anchor>>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Entity<Picker<OutlineViewDelegate>>> {
+    let task = outline_for_editor(&editor, cx)?;
+    let picker = cx.new(|cx| {
+        let mut delegate = OutlineViewDelegate::new(Outline::new(Vec::new()), editor, cx);
+        delegate.preselected_range = preselected_range;
+        breadcrumb_navigation::size_popover(Picker::uniform_list(delegate, window, cx), window)
+    });
+    window
+        .spawn(cx, {
+            let picker = picker.downgrade();
+            async move |cx| {
+                let items = task.await;
+                picker
+                    .update_in(cx, |picker, window, cx| {
+                        picker.delegate.outline = Arc::new(Outline::new(items));
+                        picker.refresh(window, cx);
+                    })
+                    .ok();
+            }
+        })
+        .detach();
+    Some(picker)
+}
+
 pub struct OutlineView {
     picker: Entity<Picker<OutlineViewDelegate>>,
+    _picker_dismissed: Subscription,
 }
 
 impl Focusable for OutlineView {
@@ -173,7 +213,7 @@ impl OutlineView {
         cx: &mut Context<Self>,
     ) -> OutlineView {
         let project = editor.read(cx).project().cloned();
-        let delegate = OutlineViewDelegate::new(cx.entity().downgrade(), outline, editor, cx);
+        let delegate = OutlineViewDelegate::new(outline, editor, cx);
         let picker = cx.new(|cx| {
             let picker = if let Some(project) = project {
                 let preview = picker_preview::editor_preview(project, window, cx);
@@ -188,36 +228,36 @@ impl OutlineView {
                 ))
                 .show_scrollbar(true)
         });
-        OutlineView { picker }
+        let picker_dismissed = cx.subscribe(&picker, |_, _, _: &DismissEvent, cx| {
+            cx.emit(DismissEvent);
+        });
+        OutlineView {
+            picker,
+            _picker_dismissed: picker_dismissed,
+        }
     }
 }
 
 struct OutlineViewDelegate {
-    outline_view: WeakEntity<OutlineView>,
     active_editor: Entity<Editor>,
     outline: Arc<Outline<Anchor>>,
     selected_match_index: usize,
     prev_scroll_position: Option<Point<ScrollOffset>>,
     matches: Vec<OutlineSearchEntry>,
+    preselected_range: Option<Range<Anchor>>,
 }
 
 enum OutlineRowHighlights {}
 
 impl OutlineViewDelegate {
-    fn new(
-        outline_view: WeakEntity<OutlineView>,
-        outline: Outline<Anchor>,
-        editor: Entity<Editor>,
-
-        cx: &mut Context<OutlineView>,
-    ) -> Self {
+    fn new(outline: Outline<Anchor>, editor: Entity<Editor>, cx: &mut App) -> Self {
         Self {
-            outline_view,
             matches: Default::default(),
             selected_match_index: 0,
             prev_scroll_position: Some(editor.update(cx, |editor, cx| editor.scroll_position(cx))),
             active_editor: editor,
             outline: Arc::new(outline),
+            preselected_range: None,
         }
     }
 
@@ -365,18 +405,36 @@ impl PickerDelegate for OutlineViewDelegate {
                                 .head();
                             (snapshot.buffer().clone(), cursor_offset)
                         });
-                    this.delegate
-                        .matches
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(ix, entry)| {
-                            let item = &this.delegate.outline.items[entry.candidate_id()];
-                            let range = item.range.to_offset(&buffer);
-                            range.contains(&cursor_offset).then_some((ix, item.depth))
+                    let preselected_range = this
+                        .delegate
+                        .preselected_range
+                        .as_ref()
+                        .map(|range| range.to_offset(&buffer));
+                    let preselected_index = preselected_range.and_then(|preselected_range| {
+                        this.delegate.matches.iter().position(|entry| {
+                            this.delegate
+                                .outline
+                                .items
+                                .get(entry.candidate_id())
+                                .is_some_and(|item| {
+                                    item.range.to_offset(&buffer) == preselected_range
+                                })
                         })
-                        .max_by_key(|(ix, depth)| (*depth, cmp::Reverse(*ix)))
-                        .map(|(ix, _)| ix)
-                        .unwrap_or(0)
+                    });
+                    preselected_index.unwrap_or_else(|| {
+                        this.delegate
+                            .matches
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(ix, entry)| {
+                                let item = &this.delegate.outline.items[entry.candidate_id()];
+                                let range = item.range.to_offset(&buffer);
+                                range.contains(&cursor_offset).then_some((ix, item.depth))
+                            })
+                            .max_by_key(|(ix, depth)| (*depth, cmp::Reverse(*ix)))
+                            .map(|(ix, _)| ix)
+                            .unwrap_or(0)
+                    })
                 } else {
                     this.delegate
                         .matches
@@ -425,12 +483,10 @@ impl PickerDelegate for OutlineViewDelegate {
         });
 
         self.dismissed(window, cx);
+        cx.emit(DismissEvent);
     }
 
     fn dismissed(&mut self, window: &mut Window, cx: &mut Context<Picker<OutlineViewDelegate>>) {
-        self.outline_view
-            .update(cx, |_, cx| cx.emit(DismissEvent))
-            .ok();
         self.restore_active_editor(window, cx);
     }
 
@@ -487,7 +543,7 @@ pub fn render_item<T, M: IntoIterator<Item = Range<usize>>>(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{cell::Cell, rc::Rc, time::Duration};
 
     use super::*;
     use futures::stream::StreamExt as _;
@@ -1000,8 +1056,8 @@ mod tests {
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
             let state = AppState::test(cx);
-            crate::init(cx);
             editor::init(cx);
+            crate::init(cx);
             state
         })
     }
@@ -1188,6 +1244,102 @@ mod tests {
             restored_names,
             vec!["struct Foo", "bar", "baz"],
             "Step 3: tree-sitter outlines should be restored after switching back"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_outline_popover_preselects_symbol_and_dismisses_on_confirm(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "a.rs": indoc!{"
+                    struct First;
+                    struct Second;
+                    struct Third;
+                "}
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        project.read_with(cx, |project, _| {
+            project.languages().add(language::rust_lang())
+        });
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = cx.read(|cx| multi_workspace.read(cx).workspace().clone());
+        let worktree_id = workspace.update(cx, |workspace, cx| {
+            workspace.project().update(cx, |project, cx| {
+                project.worktrees(cx).next().unwrap().read(cx).id()
+            })
+        });
+        let editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path((worktree_id, rel_path("a.rs")), None, true, window, cx)
+            })
+            .await
+            .unwrap()
+            .downcast::<Editor>()
+            .unwrap();
+        cx.run_until_parked();
+
+        // Take the range the way a click on a symbol segment does: from the
+        // editor's own symbol chain at the cursor.
+        set_single_caret_at_row(&editor, 1, cx);
+        cx.run_until_parked();
+        let second_range = editor.read_with(cx, |editor, cx| {
+            let symbol = editor
+                .outline_symbols_at_cursor(cx)
+                .and_then(|symbols| symbols.last())
+                .unwrap();
+            assert_eq!(symbol.text.as_ref(), "struct Second");
+            symbol.range.clone()
+        });
+        set_single_caret_at_row(&editor, 0, cx);
+        cx.run_until_parked();
+
+        let popover = cx.update(|window, cx| {
+            outline_popover(editor.clone(), Some(second_range), window, cx).unwrap()
+        });
+        let dismissed = Rc::new(Cell::new(false));
+        cx.update(|_, cx| {
+            cx.subscribe(&popover, {
+                let dismissed = dismissed.clone();
+                move |_, _: &DismissEvent, _| dismissed.set(true)
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            outline_names(&popover, cx),
+            vec!["struct First", "struct Second", "struct Third"],
+            "The popover should fill in once the outline has loaded"
+        );
+        let selected_index =
+            popover.read_with(cx, |popover, _| popover.delegate.selected_match_index);
+        assert_eq!(
+            selected_index, 1,
+            "The clicked symbol should be preselected"
+        );
+        assert_single_caret_at_row(&editor, 0, cx);
+
+        popover.update_in(cx, |popover, window, cx| {
+            popover.delegate.confirm(false, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(dismissed.get(), "Confirming should dismiss the popover");
+        assert_single_caret_at_row(&editor, 1, cx);
+        assert_eq!(
+            highlighted_display_rows(&editor, cx),
+            Vec::<u32>::new(),
+            "No rows should stay highlighted after the popover is confirmed"
         );
     }
 

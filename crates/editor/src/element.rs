@@ -6893,26 +6893,16 @@ pub fn render_breadcrumb_text(
     }
 
     let highlighted_segments = segments.into_iter().enumerate().map(|(index, segment)| {
-        let mut text_style = window.text_style();
-        if let Some(font) = &breadcrumb_font {
-            text_style.font_family = font.family.clone();
-            text_style.font_features = font.features.clone();
-            text_style.font_style = font.style;
-            text_style.font_weight = font.weight;
-        }
-        text_style.color = Color::Muted.color(cx);
-
-        if index == 0
+        let emphasize_file_name = index == 0
             && !workspace::TabBarSettings::get_global(cx).show
-            && active_item.is_dirty(cx)
-            && let Some(styled_element) = apply_dirty_filename_style(&segment, &text_style, cx)
-        {
-            return styled_element;
-        }
-
-        StyledText::new(segment.text.replace('\n', " "))
-            .with_default_highlights(&text_style, segment.highlights)
-            .into_any()
+            && active_item.is_dirty(cx);
+        render_breadcrumb_segment(
+            segment,
+            breadcrumb_font.as_ref(),
+            emphasize_file_name,
+            window,
+            cx,
+        )
     });
 
     let breadcrumbs = Itertools::intersperse_with(highlighted_segments, || {
@@ -7018,6 +7008,33 @@ pub fn render_breadcrumb_text(
             .child(breadcrumbs)
             .into_any_element(),
     }
+}
+
+pub fn render_breadcrumb_segment(
+    segment: HighlightedText,
+    breadcrumb_font: Option<&Font>,
+    emphasize_file_name: bool,
+    window: &Window,
+    cx: &App,
+) -> gpui::AnyElement {
+    let mut text_style = window.text_style();
+    if let Some(font) = breadcrumb_font {
+        text_style.font_family = font.family.clone();
+        text_style.font_features = font.features.clone();
+        text_style.font_style = font.style;
+        text_style.font_weight = font.weight;
+    }
+    text_style.color = Color::Muted.color(cx);
+
+    if emphasize_file_name
+        && let Some(styled_element) = apply_dirty_filename_style(&segment, &text_style, cx)
+    {
+        return styled_element;
+    }
+
+    StyledText::new(segment.text.replace('\n', " "))
+        .with_default_highlights(&text_style, segment.highlights)
+        .into_any()
 }
 
 fn apply_dirty_filename_style(

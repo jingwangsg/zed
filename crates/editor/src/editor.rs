@@ -107,7 +107,7 @@ pub use editor_settings::{
 };
 pub use element::{
     CursorLayout, EditorElement, HighlightedRange, HighlightedRangeLine, PointForPosition,
-    file_status_label_color, render_breadcrumb_text,
+    file_status_label_color, render_breadcrumb_segment, render_breadcrumb_text,
 };
 pub use git::blame::{BlameRenderer, GitBlame};
 pub use git::{
@@ -9454,6 +9454,21 @@ impl Editor {
         self.breadcrumb_header = Some(new_header);
     }
 
+    pub fn breadcrumb_header(&self) -> Option<&str> {
+        self.breadcrumb_header.as_deref()
+    }
+
+    /// The symbol chain shown after the path in the breadcrumbs, when it
+    /// belongs to a buffer that is still part of this editor.
+    pub fn outline_symbols_at_cursor(&self, cx: &App) -> Option<&[OutlineItem<Anchor>]> {
+        let (buffer_id, symbols) = self.outline_symbols_at_cursor.as_ref()?;
+        self.buffer()
+            .read(cx)
+            .buffer(*buffer_id)
+            .is_some()
+            .then_some(symbols.as_slice())
+    }
+
     pub fn clear_search_within_ranges(&mut self, cx: &mut Context<Self>) {
         self.clear_background_highlights(HighlightKey::SearchWithinRange, cx);
     }
@@ -11470,9 +11485,7 @@ impl Editor {
             Vec::new()
         };
 
-        if let Some((buffer_id, symbols)) = self.outline_symbols_at_cursor.as_ref()
-            && multi_buffer.buffer(*buffer_id).is_some()
-        {
+        if let Some(symbols) = self.outline_symbols_at_cursor(cx) {
             breadcrumbs.extend(symbols.iter().map(|symbol| HighlightedText {
                 text: symbol.text.clone(),
                 highlights: symbol.highlight_ranges.clone(),
