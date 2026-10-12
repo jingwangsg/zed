@@ -102,7 +102,7 @@ use lsp::{
     FileOperationRegistrationOptions, FileRename, FileSystemWatcher, LanguageServer,
     LanguageServerBinary, LanguageServerBinaryOptions, LanguageServerId, LanguageServerName,
     LanguageServerSelector, LspRequestFuture, MessageActionItem, MessageType, OneOf,
-    RenameFilesParams, TextEdit, Uri, WillRenameFiles, WorkDoneProgressCancelParams,
+    RenameFilesParams, ServerExit, TextEdit, Uri, WillRenameFiles, WorkDoneProgressCancelParams,
     notification::DidRenameFiles,
 };
 use node_runtime::read_package_installed_version;
@@ -174,6 +174,10 @@ pub use worktree::{
 };
 
 const SERVER_LAUNCHING_BEFORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+// A server that keeps dying is left stopped instead of being restarted forever.
+// The limit and window match VS Code's policy for crashed language servers.
+const LANGUAGE_SERVER_CRASH_WINDOW: Duration = Duration::from_secs(3 * 60);
+const MAX_LANGUAGE_SERVER_CRASHES_PER_WINDOW: usize = 5;
 pub const SERVER_PROGRESS_THROTTLE_TIMEOUT: Duration = Duration::from_millis(100);
 const WORKSPACE_DIAGNOSTICS_TOKEN_START: &str = "id:";
 const WORKSPACE_DIAGNOSTICS_REPULL_DELAY: Duration = Duration::from_secs(2);
@@ -359,6 +363,8 @@ pub struct LocalLspStore {
     restricted_worktrees_tasks: HashMap<WorktreeId, (Subscription, watch::Receiver<bool>)>,
     all_language_servers_stopped: bool,
     stopped_language_servers: HashSet<LanguageServerName>,
+    language_server_exit_watchers: HashMap<LanguageServerId, Task<()>>,
+    recent_language_server_crashes: HashMap<LanguageServerName, Vec<Instant>>,
 
     buffers_to_refresh_hash_set: HashSet<BufferId>,
     buffers_to_refresh_queue: VecDeque<BufferId>,
@@ -4025,6 +4031,8 @@ impl LocalLspStore {
             self.language_server_dynamic_registrations
                 .remove(server_id_to_remove);
             self.initial_server_capabilities.remove(server_id_to_remove);
+            self.language_server_exit_watchers
+                .remove(server_id_to_remove);
             self.buffer_pull_diagnostics_result_ids
                 .remove(server_id_to_remove);
             self.workspace_pull_diagnostics_result_ids
@@ -4911,6 +4919,8 @@ impl LspStore {
                 restricted_worktrees_tasks: HashMap::default(),
                 all_language_servers_stopped: false,
                 stopped_language_servers: HashSet::default(),
+                language_server_exit_watchers: HashMap::default(),
+                recent_language_server_crashes: HashMap::default(),
                 watched_manifest_filenames: ManifestProvidersStore::global(cx)
                     .manifest_file_names(),
             }),
@@ -12884,6 +12894,7 @@ impl LspStore {
             .language_server_dynamic_registrations
             .remove(&server_id);
         local.initial_server_capabilities.remove(&server_id);
+        local.language_server_exit_watchers.remove(&server_id);
 
         let server_state = local.language_servers.remove(&server_id);
         self.cleanup_lsp_data(server_id);
@@ -12924,6 +12935,110 @@ impl LspStore {
             cx.emit(LspStoreEvent::LanguageServerRemoved(server_id));
         }
         Task::ready(())
+    }
+
+    fn on_language_server_crash(
+        &mut self,
+        server_id: LanguageServerId,
+        exit: ServerExit,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(local) = self.as_local_mut() else {
+            return;
+        };
+        let Some(LanguageServerState::Running { adapter, .. }) =
+            local.language_servers.get(&server_id)
+        else {
+            return;
+        };
+        let name = adapter.name();
+        let status = exit.status.as_deref().unwrap_or("unknown exit status");
+        let stderr_tail = redact_command(exit.stderr_tail.trim());
+        if stderr_tail.is_empty() {
+            log::error!(
+                "language server {name} (id {server_id}) exited unexpectedly ({status}) \
+                 without writing to stderr"
+            );
+        } else {
+            log::error!(
+                "language server {name} (id {server_id}) exited unexpectedly ({status}); \
+                 its last stderr output:\n{stderr_tail}"
+            );
+        }
+
+        let now = Instant::now();
+        let recent_crashes = local
+            .recent_language_server_crashes
+            .entry(name.clone())
+            .or_default();
+        recent_crashes
+            .retain(|crashed_at| now.duration_since(*crashed_at) < LANGUAGE_SERVER_CRASH_WINDOW);
+        recent_crashes.push(now);
+        let crash_count = recent_crashes.len();
+
+        let buffer_ids = local
+            .buffers_opened_in_servers
+            .iter()
+            .filter(|(_, servers)| servers.contains(&server_id))
+            .map(|(buffer_id, _)| *buffer_id)
+            .collect::<Vec<_>>();
+        local
+            .lsp_tree
+            .remove_nodes(&BTreeSet::from_iter([server_id]));
+        let buffers = buffer_ids
+            .into_iter()
+            .filter_map(|buffer_id| self.buffer_store.read(cx).get(buffer_id))
+            .collect::<Vec<_>>();
+        let stop = self.stop_local_language_server(server_id, cx);
+        let window_minutes = LANGUAGE_SERVER_CRASH_WINDOW.as_secs() / 60;
+
+        if crash_count >= MAX_LANGUAGE_SERVER_CRASHES_PER_WINDOW {
+            // Keeps the next buffer of this language from starting the server
+            // again behind the user's back; `editor: restart language server`
+            // clears the set.
+            if let Some(local) = self.as_local_mut() {
+                local.stopped_language_servers.insert(name.clone());
+            }
+            let error = format!(
+                "{name} exited unexpectedly {crash_count} times in the last {window_minutes} \
+                 minutes and will not be restarted automatically. The Zed log has its last \
+                 output; run `editor: restart language server` to start it again."
+            );
+            log::error!("{error}");
+            cx.spawn(async move |lsp_store, cx| {
+                stop.await;
+                lsp_store
+                    .update(cx, |lsp_store, _| {
+                        if let Some(local) = lsp_store.as_local() {
+                            local.update_binary_status(name, BinaryStatus::Failed { error });
+                        }
+                    })
+                    .ok();
+            })
+            .detach();
+            return;
+        }
+
+        log::info!(
+            "restarting language server {name} after it exited unexpectedly (crash {crash_count} \
+             of {MAX_LANGUAGE_SERVER_CRASHES_PER_WINDOW} tolerated within {window_minutes} minutes)"
+        );
+        cx.spawn(async move |lsp_store, cx| {
+            stop.await;
+            lsp_store
+                .update(cx, |lsp_store, cx| {
+                    for buffer in buffers {
+                        lsp_store.register_buffer_with_language_servers(
+                            &buffer,
+                            HashSet::from_iter([LanguageServerSelector::Name(name.clone())]),
+                            true,
+                            cx,
+                        );
+                    }
+                })
+                .ok();
+        })
+        .detach();
     }
 
     pub fn stop_all_language_servers(&mut self, cx: &mut Context<Self>) {
@@ -13460,6 +13575,23 @@ impl LspStore {
                 server: language_server.clone(),
                 simulate_disk_based_diagnostics_completion: None,
             },
+        );
+        let exited = language_server.exited();
+        local.language_server_exit_watchers.insert(
+            server_id,
+            cx.spawn(async move |lsp_store, cx| {
+                let Some(exit) = exited.await else {
+                    return;
+                };
+                if exit.shutdown_requested {
+                    return;
+                }
+                lsp_store
+                    .update(cx, |lsp_store, cx| {
+                        lsp_store.on_language_server_crash(server_id, exit, cx)
+                    })
+                    .ok();
+            }),
         );
         local.update_binary_status(adapter.name(), BinaryStatus::None);
         if let Some(file_ops_caps) = language_server

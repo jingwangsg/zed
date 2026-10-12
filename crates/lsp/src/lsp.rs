@@ -8,7 +8,7 @@ use collections::{BTreeMap, HashMap};
 use futures::{
     AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, Future, FutureExt, StreamExt,
     channel::oneshot::{self, Canceled},
-    future::{self, Either},
+    future::{self, Either, Shared},
     io::{BufReader, BufWriter},
     select,
 };
@@ -34,7 +34,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Weak,
-        atomic::{AtomicI32, Ordering::SeqCst},
+        atomic::{AtomicBool, AtomicI32, Ordering::SeqCst},
     },
     task::Poll,
     time::{Duration, Instant},
@@ -56,6 +56,9 @@ pub const DEFAULT_LSP_REQUEST_TIMEOUT: Duration =
 
 /// The shutdown timeout for LSP servers (including Prettier/Copilot).
 const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+// Enough to keep node's heap-exhaustion report or a stack trace from a crashing
+// server, without retaining everything it logged while it was alive.
+const STDERR_TAIL_LIMIT: usize = 8 * 1024;
 
 pub fn workspace_folder_for_uri(uri: Uri) -> WorkspaceFolder {
     let name = uri
@@ -138,8 +141,23 @@ pub struct LanguageServer {
     io_tasks: Mutex<Option<(Task<Option<()>>, Task<Option<()>>)>>,
     output_done_rx: Mutex<Option<barrier::Receiver>>,
     server: Arc<Mutex<Option<Child>>>,
+    shutdown_requested: Arc<AtomicBool>,
+    exit: Shared<oneshot::Receiver<ServerExit>>,
     workspace_folders: Option<Arc<Mutex<BTreeSet<Uri>>>>,
     root_uri: Uri,
+}
+
+/// How a language server process ended, reported once its stdout and stderr
+/// have both closed.
+#[derive(Clone, Debug)]
+pub struct ServerExit {
+    /// Whether Zed had asked the server to shut down before it exited. When
+    /// false, the server died on its own.
+    pub shutdown_requested: bool,
+    /// The process exit status, when it could be collected in time.
+    pub status: Option<String>,
+    /// The last few kilobytes the server wrote to stderr.
+    pub stderr_tail: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -608,6 +626,10 @@ impl LanguageServer {
             Arc::new(Mutex::new(Some(HashMap::<_, ResponseHandler>::default())));
         let pending_respond_tasks = PendingRespondTasks::default();
         let io_handlers = Arc::new(Mutex::new(HashMap::default()));
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let server = Arc::new(Mutex::new(server));
+        let (exit_tx, exit_rx) = oneshot::channel();
 
         let stdout_input_task = cx.spawn({
             let unhandled_notification_wrapper = {
@@ -649,16 +671,30 @@ impl LanguageServer {
             .map(|stderr| {
                 let io_handlers = io_handlers.clone();
                 let stderr_captures = stderr_capture.clone();
+                let stderr_tail = stderr_tail.clone();
                 cx.background_spawn(async move {
-                    Self::handle_stderr(stderr, io_handlers, stderr_captures)
+                    Self::handle_stderr(stderr, io_handlers, stderr_captures, stderr_tail)
                         .log_err()
                         .await
                 })
             })
             .unwrap_or_else(|| Task::ready(None));
-        let input_task = cx.background_spawn(async move {
-            let (stdout, stderr) = futures::join!(stdout_input_task, stderr_input_task);
-            stdout.or(stderr)
+        let input_task = cx.background_spawn({
+            let server = server.clone();
+            let shutdown_requested = shutdown_requested.clone();
+            let executor = cx.background_executor().clone();
+            async move {
+                let (stdout, stderr) = futures::join!(stdout_input_task, stderr_input_task);
+                let status = exit_status(&server, &executor).await;
+                exit_tx
+                    .send(ServerExit {
+                        shutdown_requested: shutdown_requested.load(SeqCst),
+                        status,
+                        stderr_tail: std::mem::take(&mut *stderr_tail.lock()),
+                    })
+                    .ok();
+                stdout.or(stderr)
+            }
         });
         let output_task = cx.background_spawn({
             Self::handle_outgoing_messages(
@@ -714,10 +750,19 @@ impl LanguageServer {
             executor: cx.background_executor().clone(),
             io_tasks: Mutex::new(Some((input_task, output_task))),
             output_done_rx: Mutex::new(Some(output_done_rx)),
-            server: Arc::new(Mutex::new(server)),
+            server,
+            shutdown_requested,
+            exit: exit_rx.shared(),
             workspace_folders,
             root_uri,
         }
+    }
+
+    /// Resolves once the server's stdout and stderr have both closed, which is
+    /// how a dead process shows up. Yields `None` if the server object was torn
+    /// down before that happened.
+    pub fn exited(&self) -> impl Future<Output = Option<ServerExit>> + use<> {
+        self.exit.clone().map(|result| result.ok())
     }
 
     /// List of code action kinds this language server reports being able to emit.
@@ -789,6 +834,7 @@ impl LanguageServer {
         stderr: Stderr,
         io_handlers: Arc<Mutex<HashMap<i32, IoHandler>>>,
         stderr_capture: Arc<Mutex<Option<String>>>,
+        stderr_tail: Arc<Mutex<String>>,
     ) -> anyhow::Result<()>
     where
         Stderr: AsyncRead + Unpin + Send + 'static,
@@ -812,6 +858,16 @@ impl LanguageServer {
 
                 if let Some(stderr) = stderr_capture.lock().as_mut() {
                     stderr.push_str(message);
+                }
+
+                let mut stderr_tail = stderr_tail.lock();
+                stderr_tail.push_str(message);
+                if stderr_tail.len() > STDERR_TAIL_LIMIT {
+                    let mut cut = stderr_tail.len() - STDERR_TAIL_LIMIT;
+                    while !stderr_tail.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    stderr_tail.drain(..cut);
                 }
             }
 
@@ -1197,6 +1253,7 @@ impl LanguageServer {
 
     /// Sends a shutdown request to the language server process and prepares the [`LanguageServer`] to be dropped.
     pub fn shutdown(&self) -> Option<impl 'static + Send + Future<Output = Option<()>> + use<>> {
+        self.shutdown_requested.store(true, SeqCst);
         let tasks = self.io_tasks.lock().take()?;
 
         let response_handlers = self.response_handlers.clone();
@@ -1806,6 +1863,27 @@ impl LanguageServer {
     }
 }
 
+/// Polls the child's exit status for up to about a second after its pipes
+/// close. The status is only informational, so a process that lingers is
+/// reported without one rather than delaying the exit notification.
+async fn exit_status(
+    server: &Mutex<Option<Child>>,
+    executor: &BackgroundExecutor,
+) -> Option<String> {
+    for _ in 0..20 {
+        // The guard must not live across the await: the future has to be `Send`.
+        let status = {
+            let mut server = server.lock();
+            server.as_mut()?.try_status().ok().flatten()
+        };
+        if let Some(status) = status {
+            return Some(status.to_string());
+        }
+        executor.timer(Duration::from_millis(50)).await;
+    }
+    None
+}
+
 impl Drop for LanguageServer {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown() {
@@ -2014,6 +2092,12 @@ impl LanguageServer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl FakeLanguageServer {
+    /// Ends the fake server the way a dead process does: its pipes close without
+    /// any shutdown handshake, so the client reads end of file on stdout.
+    pub fn simulate_crash(&self) {
+        self.server.io_tasks.lock().take();
+    }
+
     /// See [`LanguageServer::notify`].
     pub fn notify<T: notification::Notification>(&self, params: T::Params) {
         self.server.notify::<T>(params).ok();
@@ -2159,6 +2243,54 @@ mod tests {
     #[ctor::ctor(unsafe)]
     fn init_logger() {
         zlog::init_test();
+    }
+
+    #[gpui::test]
+    async fn test_exit_is_reported_when_the_server_dies(cx: &mut TestAppContext) {
+        let (server, fake) = FakeLanguageServer::new(
+            LanguageServerId(0),
+            LanguageServerBinary {
+                path: "path/to/language-server".into(),
+                arguments: vec![],
+                env: None,
+            },
+            "the-lsp".to_string(),
+            Default::default(),
+            &mut cx.to_async(),
+        );
+        let exited = server.exited();
+
+        fake.simulate_crash();
+
+        let exit = exited.await.expect("a crash is reported as an exit");
+        assert!(!exit.shutdown_requested);
+    }
+
+    #[gpui::test]
+    async fn test_exit_after_shutdown_is_not_reported_as_a_crash(cx: &mut TestAppContext) {
+        let (server, fake) = FakeLanguageServer::new(
+            LanguageServerId(0),
+            LanguageServerBinary {
+                path: "path/to/language-server".into(),
+                arguments: vec![],
+                env: None,
+            },
+            "the-lsp".to_string(),
+            Default::default(),
+            &mut cx.to_async(),
+        );
+        let exited = server.exited();
+
+        // Holding the shutdown future unpolled keeps the io tasks alive, so the
+        // exit caused by the closed pipes is observed with the flag already set.
+        let shutdown = server.shutdown().expect("first shutdown");
+        fake.simulate_crash();
+
+        let exit = exited
+            .await
+            .expect("the exit is reported while the shutdown is pending");
+        assert!(exit.shutdown_requested);
+        shutdown.await;
     }
 
     #[gpui::test]

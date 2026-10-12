@@ -39,11 +39,11 @@ use gpui::{
 };
 use itertools::Itertools;
 use language::{
-    Buffer, BufferEvent, Diagnostic, DiagnosticEntry, DiagnosticEntryRef, DiagnosticMessage,
-    DiagnosticSet, DiagnosticSourceKind, DiskState, FakeLspAdapter, Language, LanguageAwareStyling,
-    LanguageConfig, LanguageMatcher, LanguageName, LineEnding, ManifestName, ManifestProvider,
-    ManifestQuery, OffsetRangeExt, Point, ToPoint, Toolchain, ToolchainList, ToolchainLister,
-    ToolchainMetadata,
+    BinaryStatus, Buffer, BufferEvent, Diagnostic, DiagnosticEntry, DiagnosticEntryRef,
+    DiagnosticMessage, DiagnosticSet, DiagnosticSourceKind, DiskState, FakeLspAdapter, Language,
+    LanguageAwareStyling, LanguageConfig, LanguageMatcher, LanguageName, LineEnding, ManifestName,
+    ManifestProvider, ManifestQuery, OffsetRangeExt, Point, ToPoint, Toolchain, ToolchainList,
+    ToolchainLister, ToolchainMetadata,
     language_settings::{
         Formatter, FormatterList, LanguageSettings, LanguageSettingsContent, LineEndingSetting,
     },
@@ -3083,6 +3083,166 @@ async fn test_restarting_server_with_diagnostics_running(cx: &mut gpui::TestAppC
                 .collect::<Vec<_>>(),
             [] as [language::LanguageServerId; 0]
         );
+    });
+}
+
+#[gpui::test]
+async fn test_language_server_is_restarted_after_it_crashes(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "" })).await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut fake_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "the-language-server",
+            ..FakeLspAdapter::default()
+        },
+    );
+    let worktree_id = project.update(cx, |p, cx| p.worktrees(cx).next().unwrap().read(cx).id());
+
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+    let crashed_server = fake_servers.next().await.unwrap();
+    cx.executor().run_until_parked();
+    let mut events = cx.events(&project);
+
+    crashed_server.simulate_crash();
+    cx.executor().run_until_parked();
+
+    // The dead server is removed, a new one is started, and the open buffer is
+    // registered with it again.
+    let mut restarted_server = fake_servers.next().await.unwrap();
+    cx.executor().run_until_parked();
+    let mut seen_events = Vec::new();
+    loop {
+        let event = events.next().await.unwrap();
+        let buffer_registered = matches!(
+            event,
+            Event::LanguageServerBufferRegistered {
+                server_id: LanguageServerId(1),
+                buffer_id: registered_buffer_id,
+                ..
+            } if registered_buffer_id == buffer_id
+        );
+        seen_events.push(event);
+        if buffer_registered {
+            break;
+        }
+    }
+    assert!(
+        seen_events.contains(&Event::LanguageServerRemoved(LanguageServerId(0))),
+        "{seen_events:?}"
+    );
+    assert!(
+        seen_events.contains(&Event::LanguageServerAdded(
+            LanguageServerId(1),
+            restarted_server.server.name(),
+            Some(worktree_id)
+        )),
+        "{seen_events:?}"
+    );
+    assert_eq!(
+        restarted_server
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document
+            .uri,
+        Uri::from_file_path(path!("/dir/a.rs")).unwrap()
+    );
+    project.read_with(cx, |project, cx| {
+        assert_eq!(
+            project
+                .language_server_statuses(cx)
+                .map(|(server_id, _)| server_id)
+                .collect::<Vec<_>>(),
+            [LanguageServerId(1)]
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_language_server_is_not_restarted_after_repeated_crashes(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "", "b.rs": "" }))
+        .await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut fake_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "the-language-server",
+            ..FakeLspAdapter::default()
+        },
+    );
+    let (mut binary_statuses, _subscription) = language_registry.language_server_binary_statuses();
+
+    let (_buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+
+    // Every crash but the last one inside the window gets a restart.
+    for crash in 1..=5 {
+        let server = fake_servers
+            .next()
+            .await
+            .unwrap_or_else(|| panic!("no server running before crash {crash}"));
+        cx.executor().run_until_parked();
+        server.simulate_crash();
+        cx.executor().run_until_parked();
+    }
+
+    assert!(
+        fake_servers.next().now_or_never().flatten().is_none(),
+        "the server was restarted after crashing too often"
+    );
+    project.read_with(cx, |project, cx| {
+        assert_eq!(project.language_server_statuses(cx).count(), 0);
+    });
+    let mut failures = Vec::new();
+    while let Ok((_, _, status)) = binary_statuses.try_recv() {
+        if let BinaryStatus::Failed { error } = status {
+            failures.push(error);
+        }
+    }
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].contains("will not be restarted automatically"),
+        "{failures:?}"
+    );
+
+    // Opening another file of the same language must not start it again either.
+    let (_other_buffer, _other_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/b.rs"), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+    assert!(
+        fake_servers.next().now_or_never().flatten().is_none(),
+        "opening another buffer restarted the server"
+    );
+    project.read_with(cx, |project, cx| {
+        assert_eq!(project.language_server_statuses(cx).count(), 0);
     });
 }
 
